@@ -618,13 +618,17 @@ const {
 
             {/* status bar */}
             <div className="mt-3 p-3 bg-white/3 rounded-xl border border-white/5 text-xs text-gray-500 break-all">
-              {playerMode === "clean" && streamUrl && (
-                <span>
-                  <span className="text-green-400 font-medium">✓ Ad-free stream active</span>
-                  {subtitles.length > 0 && ` — ${subtitles.length} subtitle track${subtitles.length !== 1 ? "s" : ""}`}
-                  {" — "}<span className="opacity-60 break-all">{streamUrl.slice(0, 80)}…</span>
-                </span>
-              )}
+            {playerMode === "clean" && streamUrl && (
+  <span>
+    <span className="text-green-400 font-medium">✓ Ad-free stream active</span>
+    {sourceLabel && (
+      <span className="text-gray-500"> via {sourceLabel}</span>
+    )}
+    {subtitles.length > 0 &&
+      ` — ${subtitles.length} subtitle track${subtitles.length !== 1 ? "s" : ""}`
+    }
+  </span>
+)}
               {playerMode === "clean" && streamLoading && (
                 <span className="text-yellow-400">Fetching stream from scraper API…</span>
               )}
