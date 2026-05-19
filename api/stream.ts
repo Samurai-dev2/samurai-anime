@@ -1,159 +1,428 @@
 // api/stream.ts
-
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import https from "https";
-import http from "http";
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // ── CORS ──────────────────────────────────────────────────
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range");
+// ─── Types ────────────────────────────────────────────────────
+interface StreamResponse {
+  url:       string | null;
+  subtitles: SubtitleTrack[];
+  intro:     TimeMark | null;
+  outro:     TimeMark | null;
+  source:    string | null;
+  error?:    string;
+}
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+interface SubtitleTrack {
+  url:   string;
+  lang:  string;
+  label: string;
+}
 
-  // ── Validate params ───────────────────────────────────────
-  const { url, referer } = req.query;
+interface TimeMark {
+  start: number;
+  end:   number;
+}
 
-  if (!url || typeof url !== "string") {
-    return res.status(400).json({ error: "Missing `url` query parameter" });
-  }
-
-  let targetUrl: URL;
-  try {
-    targetUrl = new URL(decodeURIComponent(url));
-  } catch {
-    return res.status(400).json({ error: "Invalid URL" });
-  }
-
-  // ── Only allow http/https ─────────────────────────────────
-  if (!["http:", "https:"].includes(targetUrl.protocol)) {
-    return res.status(400).json({ error: "Only http/https URLs allowed" });
-  }
-
-  const refererHeader =
-    typeof referer === "string"
-      ? decodeURIComponent(referer)
-      : "https://hianime.to";
-
-  // ── Request headers that CDN expects ─────────────────────
-  const requestHeaders: Record<string, string> = {
-    Referer:                refererHeader,
-    Origin:                 new URL(refererHeader).origin,
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    Accept:                 "*/*",
-    "Accept-Language":      "en-US,en;q=0.9",
-    "Accept-Encoding":      "identity", // don't compress — we stream raw
-    Connection:             "keep-alive",
+// Stremio stream object shape
+interface StremioStream {
+  url?:         string;
+  title?:       string;
+  name?:        string;
+  description?: string;
+  subtitles?:   Array<{ url: string; lang: string; }>;
+  behaviorHints?: {
+    subtitleTracks?: Array<{ url: string; lang: string; id?: string; }>;
+    notWebReady?:    boolean;
   };
+}
 
-  // Forward Range header for video seeking
-  if (req.headers.range) {
-    requestHeaders["Range"] = req.headers.range as string;
+// ─── Constants ────────────────────────────────────────────────
+const CONSUMET_STREMIO_BASE =
+  process.env.CONSUMET_STREMIO_URL || "https://stremio.consumet.org";
+
+const ANIME_KITSU_BASE =
+  process.env.ANIME_KITSU_URL || "https://anime-kitsu.strem.fun";
+
+const ANIWAVE_BASE =
+  process.env.ANIWAVE_URL || "https://aniwave.strem.fun";
+
+const REQUEST_TIMEOUT = 12_000; // 12 seconds
+
+// ─── Helpers ──────────────────────────────────────────────────
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+async function fetchJson<T>(url: string): Promise<T> {
+  const res = await withTimeout(
+    fetch(url, {
+      headers: {
+        "User-Agent": "SamuraiAnime/1.0",
+        "Accept":     "application/json",
+      },
+    }),
+    REQUEST_TIMEOUT,
+  );
+
+  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  return res.json() as Promise<T>;
+}
+
+// Normalize title for Stremio search
+function slugify(title: string): string {
+  return encodeURIComponent(
+    title
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+  );
+}
+
+// Pick best stream — prefer 1080p, then 720p, avoid torrents
+function pickBestStream(streams: StremioStream[]): StremioStream | null {
+  if (!streams?.length) return null;
+
+  const httpStreams = streams.filter(
+    (s) => s.url && (s.url.startsWith("http://") || s.url.startsWith("https://"))
+  );
+
+  if (!httpStreams.length) return null;
+
+  const priority = ["1080", "720", "480", "360"];
+
+  for (const res of priority) {
+    const match = httpStreams.find(
+      (s) =>
+        s.title?.includes(res) ||
+        s.name?.includes(res)   ||
+        s.description?.includes(res)
+    );
+    if (match) return match;
   }
 
-  // ── Proxy the request ─────────────────────────────────────
-  return new Promise<void>((resolve) => {
-    const transport = targetUrl.protocol === "https:" ? https : http;
+  return httpStreams[0];
+}
 
-    const proxyReq = transport.request(
-      targetUrl.toString(),
-      {
-        method:  "GET",
-        headers: requestHeaders,
-        timeout: 15_000,
-      },
-      (proxyRes) => {
-        // ── Response headers ──────────────────────────────
-        const contentType =
-          proxyRes.headers["content-type"] || "application/octet-stream";
+function extractSubtitles(stream: StremioStream): SubtitleTrack[] {
+  const raw =
+    stream.behaviorHints?.subtitleTracks ||
+    stream.subtitles ||
+    [];
 
-        res.setHeader("Content-Type", contentType);
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        res.setHeader("Cache-Control", "no-store");
+  return raw.map((s, i) => ({
+    url:   s.url,
+    lang:  s.lang || "und",
+    label: s.lang || `Track ${i + 1}`,
+  }));
+}
 
-        // Forward content-range and content-length for seeking
-        if (proxyRes.headers["content-range"]) {
-          res.setHeader("Content-Range", proxyRes.headers["content-range"]);
-        }
-        if (proxyRes.headers["content-length"]) {
-          res.setHeader("Content-Length", proxyRes.headers["content-length"]);
-        }
+// ─── Provider 1: Consumet Stremio Addon ───────────────────────
+// Endpoint: /stream/anime/series/{kitsuId}:{season}:{episode}.json
+// We search Consumet's catalog first to get the kitsu ID
+async function tryConsometStremio(
+  title:   string,
+  episode: number,
+  lang:    "sub" | "dub",
+): Promise<StreamResponse | null> {
+  try {
+    // Step 1: Search catalog to find the Kitsu ID
+    const searchUrl = `${CONSUMET_STREMIO_BASE}/catalog/anime/gogoanime-${
+      lang === "dub" ? "dub" : "sub"
+    }/search=${slugify(title)}.json`;
 
-        // ── M3U8 rewriting ────────────────────────────────
-        // Segment URLs inside .m3u8 playlists are relative to the CDN.
-        // We rewrite them to go through this proxy so every segment
-        // also has the correct Referer header.
-        if (
-          contentType.includes("mpegurl") ||
-          contentType.includes("x-mpegURL") ||
-          url.includes(".m3u8")
-        ) {
-          let body = "";
-          proxyRes.setEncoding("utf8");
+    console.log("[Consumet] Searching:", searchUrl);
 
-          proxyRes.on("data", (chunk: string) => { body += chunk; });
-
-          proxyRes.on("end", () => {
-            const baseUrl = targetUrl.toString().split("?")[0].replace(/\/[^/]*$/, "/");
-
-            const rewritten = body
-              .split("\n")
-              .map((line) => {
-                const trimmed = line.trim();
-                // Skip comments and empty lines
-                if (!trimmed || trimmed.startsWith("#")) return line;
-
-                // Build absolute segment URL
-                let absoluteSegmentUrl: string;
-                try {
-                  absoluteSegmentUrl = new URL(trimmed).toString();
-                } catch {
-                  // It's a relative URL — make it absolute
-                  absoluteSegmentUrl = baseUrl + trimmed;
-                }
-
-                // Rewrite through our proxy
-                return (
-                  `/api/stream?url=${encodeURIComponent(absoluteSegmentUrl)}` +
-                  `&referer=${encodeURIComponent(refererHeader)}`
-                );
-              })
-              .join("\n");
-
-            res.status(proxyRes.statusCode || 200).send(rewritten);
-            resolve();
-          });
-
-        } else {
-          // ── Binary stream (TS segments, MP4, etc.) ────────
-          res.writeHead(proxyRes.statusCode || 200);
-          proxyRes.pipe(res);
-          proxyRes.on("end", resolve);
-        }
-      },
+    const catalog = await fetchJson<{ metas?: Array<{ id: string; name: string; }> }>(
+      searchUrl
     );
 
-    proxyReq.on("timeout", () => {
-      proxyReq.destroy();
-      if (!res.headersSent) {
-        res.status(504).json({ error: "Upstream request timed out" });
-      }
-      resolve();
+    const meta = catalog.metas?.[0];
+    if (!meta?.id) {
+      console.log("[Consumet] No catalog results");
+      return null;
+    }
+
+    console.log("[Consumet] Found meta:", meta.id, meta.name);
+
+    // Step 2: Fetch streams for that ID
+    // ID format for Gogoanime: "kitsu:12345" or "gogoanime:title-episode-X"
+    const streamUrl = `${CONSUMET_STREMIO_BASE}/stream/anime/series/${
+      encodeURIComponent(meta.id)
+    }:1:${episode}.json`;
+
+    console.log("[Consumet] Fetching streams:", streamUrl);
+
+    const data = await fetchJson<{ streams?: StremioStream[] }>(streamUrl);
+    const stream = pickBestStream(data.streams ?? []);
+
+    if (!stream?.url) return null;
+
+    console.log("[Consumet] ✓ Got stream:", stream.url.slice(0, 60));
+
+    return {
+      url:       stream.url,
+      subtitles: extractSubtitles(stream),
+      intro:     null,
+      outro:     null,
+      source:    "Consumet (Gogoanime)",
+    };
+  } catch (err: any) {
+    console.warn("[Consumet] Failed:", err.message);
+    return null;
+  }
+}
+
+// ─── Provider 2: Anime Kitsu Stremio Addon ────────────────────
+// Uses Kitsu IDs — more reliable for non-dubbed content
+async function tryAnimeKitsu(
+  title:   string,
+  episode: number,
+  malId?:  number,
+): Promise<StreamResponse | null> {
+  try {
+    // Search by title in the Kitsu catalog
+    const searchUrl = `${ANIME_KITSU_BASE}/catalog/anime/kitsu-anime-list/search=${slugify(title)}.json`;
+
+    console.log("[Kitsu] Searching:", searchUrl);
+
+    const catalog = await fetchJson<{
+      metas?: Array<{ id: string; name: string; }>;
+    }>(searchUrl);
+
+    const meta = catalog.metas?.[0];
+    if (!meta?.id) {
+      console.log("[Kitsu] No results");
+      return null;
+    }
+
+    console.log("[Kitsu] Found:", meta.id, meta.name);
+
+    // Kitsu stream format
+    const streamUrl = `${ANIME_KITSU_BASE}/stream/anime/series/${
+      encodeURIComponent(meta.id)
+    }:1:${episode}.json`;
+
+    const data = await fetchJson<{ streams?: StremioStream[] }>(streamUrl);
+    const stream = pickBestStream(data.streams ?? []);
+
+    if (!stream?.url) return null;
+
+    console.log("[Kitsu] ✓ Got stream");
+
+    return {
+      url:       stream.url,
+      subtitles: extractSubtitles(stream),
+      intro:     null,
+      outro:     null,
+      source:    "Anime Kitsu",
+    };
+  } catch (err: any) {
+    console.warn("[Kitsu] Failed:", err.message);
+    return null;
+  }
+}
+
+// ─── Provider 3: Direct Consumet API ──────────────────────────
+// Fallback: hit consumet.org REST API directly (not stremio addon)
+const CONSUMET_API =
+  process.env.CONSUMET_API_URL || "https://api.consumet.org";
+
+async function tryConsometDirect(
+  title:   string,
+  episode: number,
+  lang:    "sub" | "dub",
+): Promise<StreamResponse | null> {
+  try {
+    // Search anime
+    const searchUrl = `${CONSUMET_API}/anime/gogoanime/${encodeURIComponent(title)}`;
+    console.log("[Consumet-Direct] Searching:", searchUrl);
+
+    const search = await fetchJson<{
+      results?: Array<{
+        id:    string;
+        title: string;
+        url:   string;
+        subOrDub?: string;
+      }>;
+    }>(searchUrl);
+
+    if (!search.results?.length) return null;
+
+    // Find sub or dub version
+    const result =
+      search.results.find(
+        (r) =>
+          r.subOrDub === lang &&
+          r.title.toLowerCase().includes(title.toLowerCase().slice(0, 10))
+      ) || search.results[0];
+
+    console.log("[Consumet-Direct] Using:", result.id);
+
+    // Fetch episode list
+    const infoUrl = `${CONSUMET_API}/anime/gogoanime/info/${encodeURIComponent(result.id)}`;
+    const info    = await fetchJson<{
+      episodes?: Array<{ id: string; number: number; }>;
+    }>(infoUrl);
+
+    const ep = info.episodes?.find((e) => e.number === episode);
+    if (!ep) {
+      console.log("[Consumet-Direct] Episode not found");
+      return null;
+    }
+
+    // Fetch stream sources
+    const sourceUrl = `${CONSUMET_API}/anime/gogoanime/watch/${encodeURIComponent(ep.id)}?server=vidstreaming`;
+    console.log("[Consumet-Direct] Fetching sources:", sourceUrl);
+
+    const sources = await fetchJson<{
+      sources?:   Array<{ url: string; quality: string; isM3U8: boolean; }>;
+      subtitles?: Array<{ url: string; lang: string; }>;
+      intro?:     { start: number; end: number; };
+      outro?:     { start: number; end: number; };
+    }>(sourceUrl);
+
+    if (!sources.sources?.length) return null;
+
+    // Pick best quality
+    const ordered = [...(sources.sources)].sort((a, b) => {
+      const order = ["1080p", "720p", "480p", "360p", "default", "backup"];
+      return order.indexOf(a.quality) - order.indexOf(b.quality);
     });
 
-    proxyReq.on("error", (err) => {
-      console.error("[stream proxy] error:", err.message);
-      if (!res.headersSent) {
-        res.status(502).json({ error: "Proxy request failed", detail: err.message });
-      }
-      resolve();
-    });
+    const best = ordered[0];
+    console.log("[Consumet-Direct] ✓ Got stream:", best.quality);
 
-    proxyReq.end();
+    return {
+      url:       best.url,
+      subtitles: (sources.subtitles ?? []).map((s, i) => ({
+        url:   s.url,
+        lang:  s.lang,
+        label: s.lang || `Track ${i + 1}`,
+      })),
+      intro:  sources.intro  ?? null,
+      outro:  sources.outro  ?? null,
+      source: `Consumet Direct (${best.quality})`,
+    };
+  } catch (err: any) {
+    console.warn("[Consumet-Direct] Failed:", err.message);
+    return null;
+  }
+}
+
+// ─── Provider 4: Zoro / Aniwatch via Consumet ─────────────────
+async function tryZoro(
+  title:   string,
+  episode: number,
+): Promise<StreamResponse | null> {
+  try {
+    const searchUrl = `${CONSUMET_API}/anime/zoro/${encodeURIComponent(title)}`;
+    console.log("[Zoro] Searching:", searchUrl);
+
+    const search = await fetchJson<{
+      results?: Array<{ id: string; title: string; }>;
+    }>(searchUrl);
+
+    if (!search.results?.length) return null;
+
+    const result = search.results[0];
+    const infoUrl = `${CONSUMET_API}/anime/zoro/info?id=${encodeURIComponent(result.id)}`;
+
+    const info = await fetchJson<{
+      episodes?: Array<{ id: string; number: number; episodeId?: string; }>;
+    }>(infoUrl);
+
+    const ep = info.episodes?.find((e) => e.number === episode);
+    if (!ep) return null;
+
+    const epId = ep.episodeId ?? ep.id;
+    const srcUrl = `${CONSUMET_API}/anime/zoro/watch?episodeId=${encodeURIComponent(epId)}`;
+    console.log("[Zoro] Fetching:", srcUrl);
+
+    const sources = await fetchJson<{
+      sources?:   Array<{ url: string; quality: string; isM3U8: boolean; }>;
+      subtitles?: Array<{ url: string; lang: string; }>;
+      intro?:     { start: number; end: number; };
+      outro?:     { start: number; end: number; };
+    }>(srcUrl);
+
+    if (!sources.sources?.length) return null;
+
+    // Prefer HLS streams
+    const hlsSources = sources.sources.filter((s) => s.isM3U8);
+    const best       = hlsSources[0] ?? sources.sources[0];
+
+    console.log("[Zoro] ✓ Got stream");
+
+    return {
+      url:       best.url,
+      subtitles: (sources.subtitles ?? []).map((s, i) => ({
+        url:   s.url,
+        lang:  s.lang,
+        label: s.lang || `Track ${i + 1}`,
+      })),
+      intro:  sources.intro ?? null,
+      outro:  sources.outro ?? null,
+      source: "Zoro/Aniwatch",
+    };
+  } catch (err: any) {
+    console.warn("[Zoro] Failed:", err.message);
+    return null;
+  }
+}
+
+// ─── Main Handler ─────────────────────────────────────────────
+export default async function handler(
+  req:  VercelRequest,
+  res:  VercelResponse,
+) {
+  // CORS
+  res.setHeader("Access-Control-Allow-Origin",  "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "GET")     return res.status(405).json({ error: "Method not allowed" });
+
+  const { title, episode, lang, malId } = req.query;
+
+  if (!title || typeof title !== "string") {
+    return res.status(400).json({ error: "title is required" });
+  }
+
+  const ep    = parseInt(String(episode || "1")) || 1;
+  const audio = (lang === "dub" ? "dub" : "sub") as "sub" | "dub";
+  const mid   = malId ? parseInt(String(malId)) : undefined;
+
+  console.log(`\n[stream] title="${title}" ep=${ep} lang=${audio} malId=${mid}`);
+
+  // Try each provider in sequence — stop on first success
+  const providers = [
+    () => tryConsometDirect(title, ep, audio),
+    () => tryZoro(title, ep),
+    () => tryConsometStremio(title, ep, audio),
+    () => tryAnimeKitsu(title, ep, mid),
+  ];
+
+  for (const provider of providers) {
+    const result = await provider();
+    if (result?.url) {
+      console.log(`[stream] ✓ Success from: ${result.source}`);
+      return res.status(200).json(result);
+    }
+  }
+
+  console.log("[stream] ✗ All providers failed");
+  return res.status(200).json({
+    url:       null,
+    subtitles: [],
+    intro:     null,
+    outro:     null,
+    source:    null,
+    error:     "No stream found across all providers",
   });
 }
