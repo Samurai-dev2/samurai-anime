@@ -277,16 +277,21 @@ export default function WatchPage() {
   const [playerMode, setPlayerMode] = useState<"clean" | "iframe">("clean");
 
   // ── Fetch ad-free stream from our API ──────────────────────
- const {
+// In WatchPage.tsx — replace the existing useStreamUrl call
+const {
   streamUrl,
   subtitles,
-  loading: streamLoading,
-  error:   streamError,
+  loading:     streamLoading,
+  error:       streamError,
   intro,
   outro,
-} = useStreamUrl(title, episode, lang);
-
-
+  sourceLabel,  // ← new
+} = useStreamUrl(
+  playerMode === "clean" ? title : null, // don't fetch if in iframe mode
+  episode,
+  lang,
+  id, // ← pass malId for better matching
+);
   // Auto-fallback to iframe if scraper fails
   useEffect(() => {
     if (streamError && playerMode === "clean") {
