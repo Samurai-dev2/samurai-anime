@@ -9,17 +9,16 @@ interface SubtitleTrack {
 }
 
 interface StreamResponse {
-  url:          string | null;
-  subtitles:    SubtitleTrack[];
-  intro:        null;
-  outro:        null;
-  source:       string | null;
-  referer?:     string;
-  headers?:     Record<string, string>;
-  error?:       string;
+  url:       string | null;
+  subtitles: SubtitleTrack[];
+  intro:     null;
+  outro:     null;
+  source:    string | null;
+  referer?:  string;
+  headers?:  Record<string, string>;
+  error?:    string;
 }
 
-// AnimePahe scraper response shapes
 interface PaheSearchResult {
   id:      number;
   title:   string;
@@ -42,7 +41,7 @@ interface PaheSource {
   url:     string;
   quality: string;
   fansub:  string;
-  audio:   string; // "jpn" | "eng"
+  audio:   string;
 }
 
 interface PaheM3u8Result {
@@ -70,7 +69,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 async function fetchJson<T>(url: string): Promise<T> {
   console.log("[fetch]", url);
-
   const res = await withTimeout(
     fetch(url, {
       headers: {
@@ -80,66 +78,75 @@ async function fetchJson<T>(url: string): Promise<T> {
     }),
     TIMEOUT_MS,
   );
-
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} — ${text.slice(0, 100)}`);
   }
-
   return res.json() as Promise<T>;
 }
 
-// Clean title for better search matching
-// e.g. "Shingeki no Kyojin Season 3" → "Shingeki no Kyojin"
 function cleanTitle(title: string): string {
   return title
-    .replace(/\s+season\s+\d+/gi, "")   // remove "Season X"
-    .replace(/\s+part\s+\d+/gi, "")     // remove "Part X"
-    .replace(/\s+cour\s+\d+/gi, "")     // remove "Cour X"
-    .replace(/\s+\(\d{4}\)/g, "")       // remove "(2024)"
-    .replace(/\s+[Ss]\d+$/g, "")        // remove "S2" at end
+    .replace(/\s+season\s+\d+/gi, "")
+    .replace(/\s+part\s+\d+/gi,   "")
+    .replace(/\s+cour\s+\d+/gi,   "")
+    .replace(/\s+\(\d{4}\)/g,     "")
+    .replace(/\s+[Ss]\d+$/g,      "")
     .trim();
 }
 
-// Score how well a search result matches our target title
 function scoreTitleMatch(result: PaheSearchResult, target: string): number {
   const a = result.title.toLowerCase();
   const b = target.toLowerCase();
-
-  if (a === b)                          return 100;
+  if (a === b)                             return 100;
   if (a.startsWith(b) || b.startsWith(a)) return 80;
-  if (a.includes(b) || b.includes(a))  return 60;
-
-  // Word overlap score
-  const wordsA = new Set(a.split(/\s+/));
-  const wordsB = b.split(/\s+/);
+  if (a.includes(b)   || b.includes(a))   return 60;
+  const wordsA  = new Set(a.split(/\s+/));
+  const wordsB  = b.split(/\s+/);
   const overlap = wordsB.filter((w) => wordsA.has(w)).length;
   return (overlap / wordsB.length) * 40;
 }
 
-// Pick best quality source based on lang preference
-function pickSource(
-  sources: PaheSource[],
-  lang:    "sub" | "dub",
-): PaheSource | null {
+function pickSource(sources: PaheSource[], lang: "sub" | "dub"): PaheSource | null {
   if (!sources.length) return null;
-
-  const audioTarget = lang === "dub" ? "eng" : "jpn";
-
-  // Preferred quality order
+  const audioTarget  = lang === "dub" ? "eng" : "jpn";
   const qualityOrder = ["1080p", "800p", "720p", "480p", "360p"];
-
-  // Filter by audio language first
   const langFiltered = sources.filter((s) => s.audio === audioTarget);
   const pool         = langFiltered.length ? langFiltered : sources;
-
-  // Pick highest quality from pool
   for (const q of qualityOrder) {
     const match = pool.find((s) => s.quality === q);
     if (match) return match;
   }
-
   return pool[0];
+}
+
+// ── Rewrite m3u8 playlist so all segment URLs go through our proxy ──
+function rewriteM3u8(content: string, baseUrl: string, referer: string): string {
+  const base       = new URL(baseUrl);
+  const encodedRef = encodeURIComponent(referer);
+
+  return content
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+
+      // Skip comments and empty lines
+      if (!trimmed || trimmed.startsWith("#")) return line;
+
+      // Resolve relative → absolute URL
+      let absoluteUrl: string;
+      try {
+        absoluteUrl = new URL(trimmed, base).toString();
+      } catch {
+        return line;
+      }
+
+      if (!absoluteUrl.startsWith("http")) return line;
+
+      // Route through our proxy
+      return `/api/proxy?url=${encodeURIComponent(absoluteUrl)}&referer=${encodedRef}`;
+    })
+    .join("\n");
 }
 
 // ─── Main AnimePahe Flow ──────────────────────────────────────
@@ -150,26 +157,23 @@ async function streamFromAnimePahe(
 ): Promise<StreamResponse | null> {
 
   // ── Step 1: Search ─────────────────────────────────────────
-  const searchTitle  = cleanTitle(title);
-  const searchUrl    = `${PAHE_API}/search?q=${encodeURIComponent(searchTitle)}`;
+  const searchTitle = cleanTitle(title);
 
   let results: PaheSearchResult[];
-
   try {
-    results = await fetchJson<PaheSearchResult[]>(searchUrl);
+    results = await fetchJson<PaheSearchResult[]>(
+      `${PAHE_API}/search?q=${encodeURIComponent(searchTitle)}`
+    );
   } catch (err: any) {
     console.error("[AnimePahe] Search failed:", err.message);
     return null;
   }
 
   if (!results?.length) {
-    console.log("[AnimePahe] No search results for:", searchTitle);
+    console.log("[AnimePahe] No results for:", searchTitle);
     return null;
   }
 
-  console.log("[AnimePahe] Search returned", results.length, "results");
-
-  // Score and sort results by title match
   const scored = results
     .map((r) => ({ result: r, score: scoreTitleMatch(r, searchTitle) }))
     .sort((a, b) => b.score - a.score);
@@ -184,52 +188,48 @@ async function streamFromAnimePahe(
 
   // ── Step 2: Get Episodes ────────────────────────────────────
   let episodes: PaheEpisode[];
-
   try {
     episodes = await fetchJson<PaheEpisode[]>(
-      `${PAHE_API}/episodes?session=${best.session}`,
+      `${PAHE_API}/episodes?session=${best.session}`
     );
   } catch (err: any) {
-    console.error("[AnimePahe] Episodes fetch failed:", err.message);
+    console.error("[AnimePahe] Episodes failed:", err.message);
     return null;
   }
 
   if (!episodes?.length) {
-    console.log("[AnimePahe] No episodes found");
+    console.log("[AnimePahe] No episodes");
     return null;
   }
 
   console.log("[AnimePahe] Got", episodes.length, "episodes");
 
-  // Find target episode
   const ep = episodes.find((e) => e.number === episode);
-
   if (!ep) {
     console.log(
-      "[AnimePahe] Episode", episode, "not found.",
-      "Available:", episodes.map((e) => e.number).slice(0, 10).join(", "), "...",
+      "[AnimePahe] Episode", episode, "not found. Available:",
+      episodes.map((e) => e.number).slice(0, 10).join(", "), "...",
     );
     return null;
   }
 
-  console.log("[AnimePahe] Found episode", ep.number, "| session:", ep.session);
+  console.log("[AnimePahe] Found ep", ep.number, "| session:", ep.session);
 
   // ── Step 3: Get Sources ─────────────────────────────────────
   let sources: PaheSource[];
-
   try {
     sources = await fetchJson<PaheSource[]>(
       `${PAHE_API}/sources` +
       `?anime_session=${best.session}` +
-      `&episode_session=${ep.session}`,
+      `&episode_session=${ep.session}`
     );
   } catch (err: any) {
-    console.error("[AnimePahe] Sources fetch failed:", err.message);
+    console.error("[AnimePahe] Sources failed:", err.message);
     return null;
   }
 
   if (!sources?.length) {
-    console.log("[AnimePahe] No sources returned");
+    console.log("[AnimePahe] No sources");
     return null;
   }
 
@@ -238,22 +238,19 @@ async function streamFromAnimePahe(
     sources.map((s) => `${s.quality}(${s.audio})`).join(", "),
   );
 
-  // Pick best source
   const source = pickSource(sources, lang);
-
   if (!source) {
-    console.log("[AnimePahe] No suitable source found");
+    console.log("[AnimePahe] No suitable source");
     return null;
   }
 
-  console.log("[AnimePahe] Picked source:", source.quality, source.audio, source.url);
+  console.log("[AnimePahe] Picked:", source.quality, source.audio, source.url);
 
   // ── Step 4: Resolve M3U8 from Kwik ─────────────────────────
   let m3u8Data: PaheM3u8Result;
-
   try {
     m3u8Data = await fetchJson<PaheM3u8Result>(
-      `${PAHE_API}/m3u8?url=${encodeURIComponent(source.url)}`,
+      `${PAHE_API}/m3u8?url=${encodeURIComponent(source.url)}`
     );
   } catch (err: any) {
     console.error("[AnimePahe] M3U8 resolve failed:", err.message);
@@ -261,19 +258,68 @@ async function streamFromAnimePahe(
   }
 
   if (!m3u8Data?.m3u8) {
-    console.log("[AnimePahe] No M3U8 URL in response");
+    console.log("[AnimePahe] No M3U8 in response");
     return null;
   }
 
   console.log("[AnimePahe] ✓ Got M3U8:", m3u8Data.m3u8.slice(0, 70) + "…");
 
+  // ── Step 5: Fetch & rewrite the m3u8 through our proxy ─────
+  // This resolves the CORS issue — browser only ever hits /api/proxy
+  const referer = m3u8Data.referer || "https://kwik.cx/";
+
+  let m3u8Content: string;
+  try {
+    const m3u8Res = await withTimeout(
+      fetch(m3u8Data.m3u8, {
+        headers: {
+          "Referer":    referer,
+          "Origin":     "https://kwik.cx",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Accept":     "*/*",
+        },
+      }),
+      15_000,
+    );
+
+    if (!m3u8Res.ok) throw new Error(`M3U8 fetch failed: ${m3u8Res.status}`);
+    m3u8Content = await m3u8Res.text();
+  } catch (err: any) {
+    console.error("[AnimePahe] M3U8 content fetch failed:", err.message);
+    // Fall back to returning proxy URL — let client fetch it
+    const proxyUrl =
+      `/api/proxy` +
+      `?url=${encodeURIComponent(m3u8Data.m3u8)}` +
+      `&referer=${encodeURIComponent(referer)}`;
+
+    return {
+      url:       proxyUrl,
+      subtitles: [],
+      intro:     null,
+      outro:     null,
+      source:    `AnimePahe (${source.quality} · ${source.audio === "eng" ? "Dub" : "Sub"})`,
+      referer,
+      headers:   m3u8Data.headers,
+    };
+  }
+
+  // Rewrite all segment/sub-playlist URLs inside the m3u8
+  const rewritten = rewriteM3u8(m3u8Content, m3u8Data.m3u8, referer);
+
+  // Encode and return as data URI so HLS.js can load it directly
+  // without needing an extra round-trip to /api/proxy
+  const encoded   = Buffer.from(rewritten).toString("base64");
+  const dataUri   = `data:application/vnd.apple.mpegurl;base64,${encoded}`;
+
+  console.log("[AnimePahe] ✓ M3U8 rewritten, segments proxied");
+
   return {
-    url:       m3u8Data.m3u8,
-    subtitles: [],           // AnimePahe uses hardcoded subs in the stream
+    url:       dataUri,
+    subtitles: [],
     intro:     null,
     outro:     null,
     source:    `AnimePahe (${source.quality} · ${source.audio === "eng" ? "Dub" : "Sub"})`,
-    referer:   m3u8Data.referer,
+    referer,
     headers:   m3u8Data.headers,
   };
 }
@@ -281,10 +327,7 @@ async function streamFromAnimePahe(
 // ═══════════════════════════════════════════════════════════════
 // MAIN HANDLER
 // ═══════════════════════════════════════════════════════════════
-export default async function handler(
-  req: VercelRequest,
-  res: VercelResponse,
-) {
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -295,9 +338,8 @@ export default async function handler(
 
   const { title, episode, lang } = req.query;
 
-  if (!title || typeof title !== "string") {
+  if (!title || typeof title !== "string")
     return res.status(400).json({ error: "title is required" });
-  }
 
   const ep    = parseInt(String(episode || "1")) || 1;
   const audio = (lang === "dub" ? "dub" : "sub") as "sub" | "dub";
@@ -311,7 +353,7 @@ export default async function handler(
     return res.status(200).json(result);
   }
 
-  console.log("[stream] ✗ Failed — no stream found");
+  console.log("[stream] ✗ No stream found");
   return res.status(200).json({
     url:       null,
     subtitles: [],
