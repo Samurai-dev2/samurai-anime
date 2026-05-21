@@ -3,8 +3,7 @@ import { useParams, useSearchParams, useNavigate } from "react-router-dom";
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   ArrowLeft, ChevronLeft, ChevronRight,
-  AlertTriangle, ExternalLink, RefreshCw, List,
-  Wifi, WifiOff, Loader2,
+  AlertTriangle, Loader2, List, RefreshCw,
 } from "lucide-react";
 import {
   LIBRARY_ANIME, AnimeEntry,
@@ -15,104 +14,23 @@ import { getAnimeMapping } from "../hooks/useFribbMapper";
 import { useStreamUrl }    from "../hooks/useStreamUrl";
 import VideoPlayer         from "../components/VideoPlayer";
 
-// ─── Types ────────────────────────────────────────────────────
 type Lang = "sub" | "dub";
-
-interface Source {
-  label:       string;
-  url:         string;
-  supportsDub: boolean;
-  supportsSub: boolean;
-}
-
-// ─── Iframe fallback sources ──────────────────────────────────
-function getSources(
-  tmdbId:  number,
-  imdbId:  string,
-  season:  number,
-  episode: number,
-  movie:   boolean,
-  lang:    Lang,
-): Source[] {
-  const isDub = lang === "dub";
-
-  if (movie) {
-    return [
-      {
-        label: "VidSrc.cc",
-        url: `https://vidsrc.cc/v2/embed/movie/${tmdbId}`,
-        supportsSub: true, supportsDub: false,
-      },
-      {
-        label: "VidLink",
-        url: isDub
-          ? `https://vidlink.pro/movie/${tmdbId}?dubbing=1`
-          : `https://vidlink.pro/movie/${tmdbId}`,
-        supportsSub: true, supportsDub: true,
-      },
-      {
-        label: "VidSrc.xyz",
-        url: `https://vidsrc.xyz/embed/movie/${tmdbId}?ds_lang=${isDub ? "en" : "ja"}`,
-        supportsSub: true, supportsDub: true,
-      },
-      {
-        label: "VidSrc.me",
-        url: imdbId
-          ? `https://vidsrc.me/embed/movie?imdb=${imdbId}&ds_lang=${isDub ? "en" : "ja"}`
-          : `https://vidsrc.me/embed/movie?tmdb=${tmdbId}&ds_lang=${isDub ? "en" : "ja"}`,
-        supportsSub: true, supportsDub: false,
-      },
-      {
-        label: "SuperEmbed",
-        url: `https://multiembed.mov/?video_id=${tmdbId}&tmdb=1`,
-        supportsSub: true, supportsDub: false,
-      },
-    ];
-  }
-
-  return [
-    {
-      label: "VidSrc.cc",
-      url: `https://vidsrc.cc/v2/embed/tv/${tmdbId}/${season}/${episode}`,
-      supportsSub: true, supportsDub: false,
-    },
-    {
-      label: "VidLink",
-      url: isDub
-        ? `https://vidlink.pro/tv/${tmdbId}/${season}/${episode}?dubbing=1`
-        : `https://vidlink.pro/tv/${tmdbId}/${season}/${episode}`,
-      supportsSub: true, supportsDub: true,
-    },
-    {
-      label: "VidSrc.xyz",
-      url: `https://vsembed.ru/embed/tv/${tmdbId}/${season}/${episode}?ds_lang=${isDub ? "en" : "ja"}`,
-      supportsSub: true, supportsDub: true,
-    },
-    {
-      label: "VidSrc.me",
-      url: imdbId
-        ? `https://vidsrc.me/embed/tv?imdb=${imdbId}&season=${season}&episode=${episode}&ds_lang=${isDub ? "en" : "ja"}`
-        : `https://vidsrc.me/embed/tv?tmdb=${tmdbId}&season=${season}&episode=${episode}&ds_lang=${isDub ? "en" : "ja"}`,
-      supportsSub: true, supportsDub: false,
-    },
-    {
-      label: "SuperEmbed",
-      url: `https://multiembed.mov/?video_id=${tmdbId}&tmdb=1&s=${season}&e=${episode}`,
-      supportsSub: true, supportsDub: false,
-    },
-  ];
-}
 
 // ─── Episode List ─────────────────────────────────────────────
 interface EpisodeListProps {
-  total: number; current: number;
-  season: number; seasons: number;
-  onSelect: (ep: number) => void;
+  total:          number;
+  current:        number;
+  season:         number;
+  seasons:        number;
+  onSelect:       (ep: number) => void;
   onSeasonChange: (s: number) => void;
 }
 
-function EpisodeList({ total, current, season, seasons, onSelect, onSeasonChange }: EpisodeListProps) {
+function EpisodeList({
+  total, current, season, seasons, onSelect, onSeasonChange,
+}: EpisodeListProps) {
   const listRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     listRef.current
       ?.querySelector(`[data-ep="${current}"]`)
@@ -209,8 +127,7 @@ function NoStreamScreen({ onBack }: { onBack: () => void }) {
         </div>
         <h2 className="text-2xl font-bold text-white mb-2">No Stream Available</h2>
         <p className="text-gray-400 text-sm mb-6 leading-relaxed">
-          This anime doesn't have a TMDB ID in our database yet so we can't load a
-          stream. Try another source or browse the library.
+          We couldn't find a stream for this title right now. Please try again later.
         </p>
         <div className="flex gap-3 justify-center">
           <button
@@ -245,9 +162,6 @@ export default function WatchPage() {
   );
 
   const mapping      = getAnimeMapping(id);
-  const tmdbId       = mapping?.tmdb ?? null;
-  const imdbId       = mapping?.imdb ?? "";
-  const mappedSeason = mapping?.season ?? 1;
   const movie        = mapping?.type?.toLowerCase() === "movie";
 
   const title =
@@ -264,106 +178,58 @@ export default function WatchPage() {
     "";
 
   // ── State ──────────────────────────────────────────────────
-  const [season,        setSeason]        = useState(parseInt(searchParams.get("season")  || String(mappedSeason)));
-  const [episode,       setEpisode]       = useState(parseInt(searchParams.get("episode") || "1"));
-  const [lang,          setLang]          = useState<Lang>((searchParams.get("lang") as Lang) || "sub");
-  const [sourceIdx,     setSourceIdx]     = useState(0);
-  const [reloadCounter, setReloadCounter] = useState(0);
-  const [showEpList,    setShowEpList]    = useState(true);
+  const mappedSeason = mapping?.season ?? 1;
 
-  // ── Player mode ────────────────────────────────────────────
-  // "clean"  = our scraper API + VideoPlayer (no ads)
-  // "iframe" = fallback embed sources (may have ads)
-  const [playerMode, setPlayerMode] = useState<"clean" | "iframe">("clean");
+  const [season,        setSeason]     = useState(parseInt(searchParams.get("season")  || String(mappedSeason)));
+  const [episode,       setEpisode]    = useState(parseInt(searchParams.get("episode") || "1"));
+  const [lang,          setLang]       = useState<Lang>((searchParams.get("lang") as Lang) || "sub");
+  const [showEpList,    setShowEpList] = useState(true);
+  const [reloadKey,     setReloadKey]  = useState(0);
 
-  // ── Fetch ad-free stream from our API ──────────────────────
-// In WatchPage.tsx — replace the existing useStreamUrl call
-const {
-  streamUrl,
-  subtitles,
-  loading:     streamLoading,
-  error:       streamError,
-  intro,
-  outro,
-  sourceLabel,  // ← new
-} = useStreamUrl(
-  playerMode === "clean" ? title : null, // don't fetch if in iframe mode
-  episode,
-  lang,
-  id, // ← pass malId for better matching
-);
-  // Auto-fallback to iframe if scraper fails
-  useEffect(() => {
-    if (streamError && playerMode === "clean") {
-      console.warn("Ad-free stream failed, switching to iframe fallback:", streamError);
-      setPlayerMode("iframe");
-    }
-  }, [streamError]);
-
-  // Switch back to clean if a stream becomes available
-  useEffect(() => {
-    if (streamUrl) setPlayerMode("clean");
-  }, [streamUrl]);
-
-  // ── Iframe fallback sources ────────────────────────────────
-  const allSources = tmdbId
-    ? getSources(tmdbId, imdbId, season, episode, movie, lang)
-    : [];
-
-  const sources = lang === "dub"
-    ? allSources.filter((s) => s.supportsDub)
-    : allSources.filter((s) => s.supportsSub);
-
-  const clampedIdx    = Math.min(sourceIdx, Math.max(0, sources.length - 1));
-  const currentSource = sources[clampedIdx] ?? null;
-  const iframeKey     = `${lang}-${season}-${episode}-${clampedIdx}-${reloadCounter}`;
+  // ── Stream ─────────────────────────────────────────────────
+  const {
+    streamUrl,
+    subtitles,
+    streamHeaders,
+    loading:     streamLoading,
+    error:       streamError,
+    sourceLabel,
+  } = useStreamUrl(title, episode, lang, id);
 
   // ── Sync URL + save progress ───────────────────────────────
   useEffect(() => {
     if (!id) return;
     addToWatchHistory(id);
-    saveContinueWatching({ malId: id, season, episode, timestamp: Date.now(), percent: 0 });
+    saveContinueWatching({
+      malId: id, season, episode,
+      timestamp: Date.now(), percent: 0,
+    });
     setSearchParams(
       { season: String(season), episode: String(episode), lang },
       { replace: true },
     );
   }, [id, season, episode, lang, setSearchParams]);
 
-  const reload = useCallback(() => setReloadCounter((p) => p + 1), []);
+  // ── Handlers ───────────────────────────────────────────────
+  const reload = useCallback(() => setReloadKey((k) => k + 1), []);
 
   const handleLangChange = useCallback((l: Lang) => {
     setLang(l);
-    setSourceIdx(0);
-    setReloadCounter((p) => p + 1);
-  }, []);
-
-  const handleSourceChange = useCallback((idx: number) => {
-    setSourceIdx(idx);
-    setReloadCounter((p) => p + 1);
+    setReloadKey((k) => k + 1);
   }, []);
 
   const prevEp = useCallback(() => {
-    if (episode > 1)       setEpisode((e) => e - 1);
+    if (episode > 1)        setEpisode((e) => e - 1);
     else if (season > 1) { setSeason((s) => s - 1); setEpisode(1); }
-    setReloadCounter((p) => p + 1);
   }, [episode, season]);
 
   const nextEp = useCallback(() => {
-    if (episode < totalEpisodes)       setEpisode((e) => e + 1);
+    if (episode < totalEpisodes)         setEpisode((e) => e + 1);
     else if (season < totalSeasons) { setSeason((s) => s + 1); setEpisode(1); }
-    setReloadCounter((p) => p + 1);
   }, [episode, totalEpisodes, season, totalSeasons]);
 
-  const selectEp = useCallback((ep: number) => {
-    setEpisode(ep);
-    setReloadCounter((p) => p + 1);
-  }, []);
-
-  const selectSeason = useCallback((s: number) => {
-    setSeason(s);
-    setEpisode(1);
-    setReloadCounter((p) => p + 1);
-  }, []);
+  const selectEp     = useCallback((ep: number) => setEpisode(ep),     []);
+  const selectSeason = useCallback((s: number)  => { setSeason(s); setEpisode(1); }, []);
 
   // ── Guards ─────────────────────────────────────────────────
   if (!id || isNaN(id)) {
@@ -384,7 +250,6 @@ const {
   }
 
   if (!localAnime && jikanLoading) return <LoadingScreen />;
-  if (!tmdbId)                     return <NoStreamScreen onBack={() => navigate(-1)} />;
 
   // ── UI ─────────────────────────────────────────────────────
   return (
@@ -403,7 +268,9 @@ const {
           <div className="h-4 w-px bg-white/10" />
 
           <div className="min-w-0 flex-1">
-            <span className="text-white font-semibold text-sm sm:text-base truncate">{title}</span>
+            <span className="text-white font-semibold text-sm sm:text-base truncate">
+              {title}
+            </span>
             <span className="text-gray-500 text-sm ml-2">
               {movie ? "— Movie" : `— Season ${season}, Episode ${episode}`}
             </span>
@@ -418,16 +285,9 @@ const {
             {lang === "dub" ? "🎙 EN Dub" : "🎌 JP Sub"}
           </span>
 
-          {/* ad-free indicator */}
-          <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
-            playerMode === "clean"
-              ? "bg-green-500/10 border-green-500/20 text-green-400"
-              : "bg-yellow-500/10 border-yellow-500/20 text-yellow-400"
-          }`}>
-            {playerMode === "clean"
-              ? <><Wifi className="w-3 h-3" /> Ad-Free</>
-              : <><WifiOff className="w-3 h-3" /> Fallback</>
-            }
+          {/* ad-free badge — always on now */}
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border bg-green-500/10 border-green-500/20 text-green-400">
+            ✨ Ad-Free
           </div>
         </div>
 
@@ -436,75 +296,49 @@ const {
           {/* ── Left: Player ── */}
           <div>
 
-            {/* ══ CLEAN AD-FREE PLAYER ══ */}
-            {playerMode === "clean" && (
-              <>
-                {streamLoading ? (
-                  // loading state while scraper runs
-                  <div className="aspect-video w-full bg-zinc-900/80 rounded-2xl ring-1 ring-white/10 flex items-center justify-center">
-                    <div className="flex flex-col items-center gap-3">
-                      <Loader2 className="w-10 h-10 text-red-500 animate-spin" />
-                      <p className="text-gray-400 text-sm">Fetching ad-free stream…</p>
-                      <p className="text-gray-600 text-xs">This may take a few seconds</p>
-                    </div>
-                  </div>
-                ) : streamUrl ? (
-                  // stream found — play it!
-                  <VideoPlayer
-                    streamUrl={streamUrl}
-                    subtitles={subtitles}
-                    poster={coverImage}
-                    title={movie ? title : `${title} S${season}E${episode}`}
-                  />
-                ) : (
-                  // scraper returned nothing — let user switch manually
-                  <div className="aspect-video w-full bg-zinc-900/80 rounded-2xl ring-1 ring-white/10 flex items-center justify-center">
-                    <div className="text-center px-6">
-                      <AlertTriangle className="w-10 h-10 text-yellow-400 mx-auto mb-3" />
-                      <p className="text-white font-semibold mb-1">Ad-free stream unavailable</p>
-                      <p className="text-gray-400 text-sm mb-4">
-                        The scraper couldn't find a stream for this title right now.
-                      </p>
-                      <button
-                        onClick={() => setPlayerMode("iframe")}
-                        className="px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl text-sm font-semibold transition-colors"
-                      >
-                        Use Fallback Player
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </>
-            )}
+            {/* ── Player area ── */}
+            {streamLoading ? (
+              <div className="aspect-video w-full bg-zinc-900/80 rounded-2xl ring-1 ring-white/10 flex items-center justify-center">
+                <div className="flex flex-col items-center gap-3">
+                  <Loader2 className="w-10 h-10 text-red-500 animate-spin" />
+                  <p className="text-gray-400 text-sm">Fetching stream…</p>
+                  <p className="text-gray-600 text-xs">This may take a few seconds</p>
+                </div>
+              </div>
 
-            {/* ══ IFRAME FALLBACK PLAYER ══ */}
-            {playerMode === "iframe" && (
-              <>
-                {currentSource ? (
-                  <div className="relative bg-black rounded-2xl overflow-hidden ring-1 ring-white/10 shadow-2xl shadow-black/60">
-                    <div className="aspect-video w-full">
-                      <iframe
-                        key={iframeKey}
-                        src={currentSource.url}
-                        className="w-full h-full"
-                        allowFullScreen
-                        allow="autoplay; fullscreen; picture-in-picture"
-                        referrerPolicy="no-referrer"
-                        title={movie ? title : `${title} S${season}E${episode}`}
-                      />
-                    </div>
-                    <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/40 to-transparent pointer-events-none h-16" />
-                  </div>
-                ) : (
-                  <NoStreamScreen onBack={() => navigate(-1)} />
-                )}
-              </>
+            ) : streamUrl ? (
+              <VideoPlayer
+                key={reloadKey}
+                streamUrl={streamUrl}
+                subtitles={subtitles}
+                poster={coverImage}
+                title={movie ? title : `${title} S${season}E${episode}`}
+                referer={streamHeaders?.referer}
+              />
+
+            ) : (
+              // Nothing found
+              <div className="aspect-video w-full bg-zinc-900/80 rounded-2xl ring-1 ring-white/10 flex items-center justify-center">
+                <div className="text-center px-6">
+                  <AlertTriangle className="w-10 h-10 text-yellow-400 mx-auto mb-3" />
+                  <p className="text-white font-semibold mb-1">Stream unavailable</p>
+                  <p className="text-gray-400 text-sm mb-4">
+                    {streamError ?? "Couldn't find a stream for this title right now."}
+                  </p>
+                  <button
+                    onClick={reload}
+                    className="flex items-center gap-2 mx-auto px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl text-sm font-semibold transition-colors"
+                  >
+                    <RefreshCw className="w-4 h-4" /> Try Again
+                  </button>
+                </div>
+              </div>
             )}
 
             {/* ── Controls ── */}
             <div className="mt-4 flex flex-wrap items-center gap-3">
 
-              {/* prev / next episode */}
+              {/* prev / next */}
               {!movie && (
                 <div className="flex gap-2">
                   <button
@@ -527,70 +361,15 @@ const {
               {/* sub / dub */}
               <LangToggle lang={lang} onChange={handleLangChange} />
 
-              {/* player mode toggle */}
-              <div className="flex gap-1.5">
-                <button
-                  onClick={() => setPlayerMode("clean")}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                    playerMode === "clean"
-                      ? "bg-green-600 text-white"
-                      : "bg-white/5 border border-white/10 text-gray-400 hover:text-white hover:bg-white/10"
-                  }`}
-                >
-                  <Wifi className="w-3 h-3" /> Ad-Free
-                </button>
-                <button
-                  onClick={() => setPlayerMode("iframe")}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                    playerMode === "iframe"
-                      ? "bg-yellow-600 text-white"
-                      : "bg-white/5 border border-white/10 text-gray-400 hover:text-white hover:bg-white/10"
-                  }`}
-                >
-                  <WifiOff className="w-3 h-3" /> Fallback
-                </button>
-              </div>
-
-              {/* iframe source switcher — only visible in iframe mode */}
-              {playerMode === "iframe" && (
-                <div className="flex gap-1.5 flex-wrap">
-                  {sources.map((src, idx) => (
-                    <button
-                      key={src.label}
-                      onClick={() => handleSourceChange(idx)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                        idx === clampedIdx
-                          ? "bg-red-600 text-white"
-                          : "bg-white/5 border border-white/10 text-gray-400 hover:text-white hover:bg-white/10"
-                      }`}
-                    >
-                      {src.label}
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              {/* utility buttons */}
+              {/* utility */}
               <div className="ml-auto flex gap-2">
                 <button
                   onClick={reload}
                   title="Reload player"
-                  className="flex items-center px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs text-gray-400 hover:text-white transition-colors"
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs text-gray-400 hover:text-white transition-colors"
                 >
-                  <RefreshCw className="w-3.5 h-3.5" />
+                  <RefreshCw className="w-3.5 h-3.5" /> Reload
                 </button>
-
-                {playerMode === "iframe" && currentSource && (
-                  <a
-                    href={currentSource.url}
-                    target="_blank"
-                    rel="noreferrer"
-                    title="Open in new tab"
-                    className="flex items-center px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg text-xs text-gray-400 hover:text-white transition-colors"
-                  >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                  </a>
-                )}
 
                 {!movie && (
                   <button
@@ -608,38 +387,32 @@ const {
               <div className="mt-3 flex items-start gap-2 p-3 bg-blue-500/5 border border-blue-500/10 rounded-xl text-xs text-blue-400">
                 <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" />
                 <p>
-                  Showing only sources that support English dub.
-                  <strong> VidLink</strong> and <strong>VidSrc.xyz</strong> are most
-                  reliable for dubbed content. Not all anime have an English dub — if
-                  Japanese audio plays, the dub doesn't exist for this title.
+                  Not all anime have an English dub. If Japanese audio plays,
+                  a dub doesn't exist for this title yet.
                 </p>
               </div>
             )}
 
             {/* status bar */}
-            <div className="mt-3 p-3 bg-white/3 rounded-xl border border-white/5 text-xs text-gray-500 break-all">
-            {playerMode === "clean" && streamUrl && (
-  <span>
-    <span className="text-green-400 font-medium">✓ Ad-free stream active</span>
-    {sourceLabel && (
-      <span className="text-gray-500"> via {sourceLabel}</span>
-    )}
-    {subtitles.length > 0 &&
-      ` — ${subtitles.length} subtitle track${subtitles.length !== 1 ? "s" : ""}`
-    }
-  </span>
-)}
-              {playerMode === "clean" && streamLoading && (
-                <span className="text-yellow-400">Fetching stream from scraper API…</span>
+            <div className="mt-3 p-3 bg-white/3 rounded-xl border border-white/5 text-xs text-gray-500">
+              {streamLoading && (
+                <span className="text-yellow-400">Fetching stream…</span>
               )}
-              {playerMode === "clean" && streamError && !streamUrl && (
-                <span className="text-red-400">Scraper error: {streamError}</span>
+              {streamUrl && !streamLoading && (
+                <span>
+                  <span className="text-green-400 font-medium">✓ Stream active</span>
+                  {sourceLabel && (
+                    <span className="text-gray-500"> via {sourceLabel}</span>
+                  )}
+                  {subtitles.length > 0 && (
+                    <span className="text-gray-600">
+                      {" "}— {subtitles.length} subtitle track{subtitles.length !== 1 ? "s" : ""}
+                    </span>
+                  )}
+                </span>
               )}
-              {playerMode === "iframe" && currentSource && (
-                <>
-                  <span className="text-yellow-400 font-medium">Fallback embed — may contain ads</span>
-                  {" — "}{currentSource.url}
-                </>
+              {streamError && !streamUrl && !streamLoading && (
+                <span className="text-red-400">Error: {streamError}</span>
               )}
             </div>
 
@@ -648,8 +421,8 @@ const {
               <div className="lg:hidden mt-4">
                 <EpisodeList
                   total={totalEpisodes} current={episode}
-                  season={season} seasons={totalSeasons}
-                  onSelect={selectEp} onSeasonChange={selectSeason}
+                  season={season}       seasons={totalSeasons}
+                  onSelect={selectEp}   onSeasonChange={selectSeason}
                 />
               </div>
             )}
@@ -671,13 +444,9 @@ const {
                   {movie ? "Movie" : `S${season} · E${episode} of ${totalEpisodes}`}
                 </p>
 
-                {/* player mode badge */}
-                <div className={`inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-xs font-semibold border ${
-                  playerMode === "clean"
-                    ? "bg-green-500/15 text-green-400 border-green-500/20"
-                    : "bg-yellow-500/15 text-yellow-400 border-yellow-500/20"
-                }`}>
-                  {playerMode === "clean" ? "✨ Ad-Free Player" : "📺 Fallback Player"}
+                {/* badges */}
+                <div className="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-xs font-semibold border bg-green-500/15 text-green-400 border-green-500/20">
+                  ✨ Ad-Free
                 </div>
 
                 <span className={`flex mt-1.5 w-fit items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold ${
@@ -688,22 +457,12 @@ const {
                   {lang === "dub" ? "🎙 English Dub" : "🎌 Japanese Sub"}
                 </span>
 
-                {imdbId && (
+                {sourceLabel && (
                   <p className="text-gray-600 text-xs mt-2">
-                    IMDb:{" "}
-                    <a
-                      href={`https://www.imdb.com/title/${imdbId}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-gray-500 hover:text-red-400 transition-colors"
-                    >
-                      {imdbId}
-                    </a>
+                    Source: <span className="text-gray-500">{sourceLabel}</span>
                   </p>
                 )}
-                <p className="text-gray-600 text-xs mt-1">
-                  TMDB: <span className="text-gray-500">{tmdbId}</span>
-                </p>
+
                 <button
                   onClick={() => navigate(`/anime/${id}`)}
                   className="mt-2 text-red-400 text-xs hover:text-red-300 transition-colors"
@@ -717,8 +476,8 @@ const {
               <div className="hidden lg:block">
                 <EpisodeList
                   total={totalEpisodes} current={episode}
-                  season={season} seasons={totalSeasons}
-                  onSelect={selectEp} onSeasonChange={selectSeason}
+                  season={season}       seasons={totalSeasons}
+                  onSelect={selectEp}   onSeasonChange={selectSeason}
                 />
               </div>
             )}
