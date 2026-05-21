@@ -2,393 +2,298 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 // ─── Types ────────────────────────────────────────────────────
-interface StreamResponse {
-  url:       string | null;
-  subtitles: SubtitleTrack[];
-  intro:     TimeMark | null;
-  outro:     TimeMark | null;
-  source:    string | null;
-  error?:    string;
-}
-
 interface SubtitleTrack {
   url:   string;
   lang:  string;
   label: string;
 }
 
-interface TimeMark {
-  start: number;
-  end:   number;
+interface StreamResponse {
+  url:          string | null;
+  subtitles:    SubtitleTrack[];
+  intro:        null;
+  outro:        null;
+  source:       string | null;
+  referer?:     string;
+  headers?:     Record<string, string>;
+  error?:       string;
 }
 
-// Stremio stream object shape
-interface StremioStream {
-  url?:         string;
-  title?:       string;
-  name?:        string;
-  description?: string;
-  subtitles?:   Array<{ url: string; lang: string; }>;
-  behaviorHints?: {
-    subtitleTracks?: Array<{ url: string; lang: string; id?: string; }>;
-    notWebReady?:    boolean;
-  };
+// AnimePahe scraper response shapes
+interface PaheSearchResult {
+  id:      number;
+  title:   string;
+  url:     string;
+  year:    number;
+  poster:  string;
+  type:    string;
+  session: string;
 }
 
-// ─── Constants ────────────────────────────────────────────────
-const CONSUMET_STREMIO_BASE =
-  process.env.CONSUMET_STREMIO_URL || "https://stremio.consumet.org";
+interface PaheEpisode {
+  id:       number;
+  number:   number;
+  title:    string;
+  snapshot: string;
+  session:  string;
+}
 
-const ANIME_KITSU_BASE =
-  process.env.ANIME_KITSU_URL || "https://anime-kitsu.strem.fun";
+interface PaheSource {
+  url:     string;
+  quality: string;
+  fansub:  string;
+  audio:   string; // "jpn" | "eng"
+}
 
-const ANIWAVE_BASE =
-  process.env.ANIWAVE_URL || "https://aniwave.strem.fun";
+interface PaheM3u8Result {
+  m3u8:      string;
+  referer:   string;
+  headers:   Record<string, string>;
+  proxy_url: string;
+}
 
-const REQUEST_TIMEOUT = 12_000; // 12 seconds
+// ─── Config ───────────────────────────────────────────────────
+const PAHE_API =
+  process.env.ANIMEPAHE_API_URL || "https://your-animepahe-scraper.onrender.com";
+
+const TIMEOUT_MS = 20_000;
 
 // ─── Helpers ──────────────────────────────────────────────────
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     promise,
     new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms)
+      setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms)
     ),
   ]);
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
+  console.log("[fetch]", url);
+
   const res = await withTimeout(
     fetch(url, {
       headers: {
-        "User-Agent": "SamuraiAnime/1.0",
+        "User-Agent": "Mozilla/5.0 (compatible; SamuraiAnime/1.0)",
         "Accept":     "application/json",
       },
     }),
-    REQUEST_TIMEOUT,
+    TIMEOUT_MS,
   );
 
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} — ${text.slice(0, 100)}`);
+  }
+
   return res.json() as Promise<T>;
 }
 
-// Normalize title for Stremio search
-function slugify(title: string): string {
-  return encodeURIComponent(
-    title
-      .toLowerCase()
-      .replace(/[^a-z0-9\s]/g, "")
-      .replace(/\s+/g, " ")
-      .trim()
-  );
+// Clean title for better search matching
+// e.g. "Shingeki no Kyojin Season 3" → "Shingeki no Kyojin"
+function cleanTitle(title: string): string {
+  return title
+    .replace(/\s+season\s+\d+/gi, "")   // remove "Season X"
+    .replace(/\s+part\s+\d+/gi, "")     // remove "Part X"
+    .replace(/\s+cour\s+\d+/gi, "")     // remove "Cour X"
+    .replace(/\s+\(\d{4}\)/g, "")       // remove "(2024)"
+    .replace(/\s+[Ss]\d+$/g, "")        // remove "S2" at end
+    .trim();
 }
 
-// Pick best stream — prefer 1080p, then 720p, avoid torrents
-function pickBestStream(streams: StremioStream[]): StremioStream | null {
-  if (!streams?.length) return null;
+// Score how well a search result matches our target title
+function scoreTitleMatch(result: PaheSearchResult, target: string): number {
+  const a = result.title.toLowerCase();
+  const b = target.toLowerCase();
 
-  const httpStreams = streams.filter(
-    (s) => s.url && (s.url.startsWith("http://") || s.url.startsWith("https://"))
-  );
+  if (a === b)                          return 100;
+  if (a.startsWith(b) || b.startsWith(a)) return 80;
+  if (a.includes(b) || b.includes(a))  return 60;
 
-  if (!httpStreams.length) return null;
+  // Word overlap score
+  const wordsA = new Set(a.split(/\s+/));
+  const wordsB = b.split(/\s+/);
+  const overlap = wordsB.filter((w) => wordsA.has(w)).length;
+  return (overlap / wordsB.length) * 40;
+}
 
-  const priority = ["1080", "720", "480", "360"];
+// Pick best quality source based on lang preference
+function pickSource(
+  sources: PaheSource[],
+  lang:    "sub" | "dub",
+): PaheSource | null {
+  if (!sources.length) return null;
 
-  for (const res of priority) {
-    const match = httpStreams.find(
-      (s) =>
-        s.title?.includes(res) ||
-        s.name?.includes(res)   ||
-        s.description?.includes(res)
-    );
+  const audioTarget = lang === "dub" ? "eng" : "jpn";
+
+  // Preferred quality order
+  const qualityOrder = ["1080p", "800p", "720p", "480p", "360p"];
+
+  // Filter by audio language first
+  const langFiltered = sources.filter((s) => s.audio === audioTarget);
+  const pool         = langFiltered.length ? langFiltered : sources;
+
+  // Pick highest quality from pool
+  for (const q of qualityOrder) {
+    const match = pool.find((s) => s.quality === q);
     if (match) return match;
   }
 
-  return httpStreams[0];
+  return pool[0];
 }
 
-function extractSubtitles(stream: StremioStream): SubtitleTrack[] {
-  const raw =
-    stream.behaviorHints?.subtitleTracks ||
-    stream.subtitles ||
-    [];
-
-  return raw.map((s, i) => ({
-    url:   s.url,
-    lang:  s.lang || "und",
-    label: s.lang || `Track ${i + 1}`,
-  }));
-}
-
-// ─── Provider 1: Consumet Stremio Addon ───────────────────────
-// Endpoint: /stream/anime/series/{kitsuId}:{season}:{episode}.json
-// We search Consumet's catalog first to get the kitsu ID
-async function tryConsometStremio(
+// ─── Main AnimePahe Flow ──────────────────────────────────────
+async function streamFromAnimePahe(
   title:   string,
   episode: number,
   lang:    "sub" | "dub",
 ): Promise<StreamResponse | null> {
+
+  // ── Step 1: Search ─────────────────────────────────────────
+  const searchTitle  = cleanTitle(title);
+  const searchUrl    = `${PAHE_API}/search?q=${encodeURIComponent(searchTitle)}`;
+
+  let results: PaheSearchResult[];
+
   try {
-    // Step 1: Search catalog to find the Kitsu ID
-    const searchUrl = `${CONSUMET_STREMIO_BASE}/catalog/anime/gogoanime-${
-      lang === "dub" ? "dub" : "sub"
-    }/search=${slugify(title)}.json`;
+    results = await fetchJson<PaheSearchResult[]>(searchUrl);
+  } catch (err: any) {
+    console.error("[AnimePahe] Search failed:", err.message);
+    return null;
+  }
 
-    console.log("[Consumet] Searching:", searchUrl);
+  if (!results?.length) {
+    console.log("[AnimePahe] No search results for:", searchTitle);
+    return null;
+  }
 
-    const catalog = await fetchJson<{ metas?: Array<{ id: string; name: string; }> }>(
-      searchUrl
+  console.log("[AnimePahe] Search returned", results.length, "results");
+
+  // Score and sort results by title match
+  const scored = results
+    .map((r) => ({ result: r, score: scoreTitleMatch(r, searchTitle) }))
+    .sort((a, b) => b.score - a.score);
+
+  console.log(
+    "[AnimePahe] Top matches:",
+    scored.slice(0, 3).map((s) => `"${s.result.title}" (${s.score})`).join(", "),
+  );
+
+  const best = scored[0].result;
+  console.log("[AnimePahe] Using:", best.title, "| session:", best.session);
+
+  // ── Step 2: Get Episodes ────────────────────────────────────
+  let episodes: PaheEpisode[];
+
+  try {
+    episodes = await fetchJson<PaheEpisode[]>(
+      `${PAHE_API}/episodes?session=${best.session}`,
     );
-
-    const meta = catalog.metas?.[0];
-    if (!meta?.id) {
-      console.log("[Consumet] No catalog results");
-      return null;
-    }
-
-    console.log("[Consumet] Found meta:", meta.id, meta.name);
-
-    // Step 2: Fetch streams for that ID
-    // ID format for Gogoanime: "kitsu:12345" or "gogoanime:title-episode-X"
-    const streamUrl = `${CONSUMET_STREMIO_BASE}/stream/anime/series/${
-      encodeURIComponent(meta.id)
-    }:1:${episode}.json`;
-
-    console.log("[Consumet] Fetching streams:", streamUrl);
-
-    const data = await fetchJson<{ streams?: StremioStream[] }>(streamUrl);
-    const stream = pickBestStream(data.streams ?? []);
-
-    if (!stream?.url) return null;
-
-    console.log("[Consumet] ✓ Got stream:", stream.url.slice(0, 60));
-
-    return {
-      url:       stream.url,
-      subtitles: extractSubtitles(stream),
-      intro:     null,
-      outro:     null,
-      source:    "Consumet (Gogoanime)",
-    };
   } catch (err: any) {
-    console.warn("[Consumet] Failed:", err.message);
+    console.error("[AnimePahe] Episodes fetch failed:", err.message);
     return null;
   }
-}
 
-// ─── Provider 2: Anime Kitsu Stremio Addon ────────────────────
-// Uses Kitsu IDs — more reliable for non-dubbed content
-async function tryAnimeKitsu(
-  title:   string,
-  episode: number,
-  malId?:  number,
-): Promise<StreamResponse | null> {
+  if (!episodes?.length) {
+    console.log("[AnimePahe] No episodes found");
+    return null;
+  }
+
+  console.log("[AnimePahe] Got", episodes.length, "episodes");
+
+  // Find target episode
+  const ep = episodes.find((e) => e.number === episode);
+
+  if (!ep) {
+    console.log(
+      "[AnimePahe] Episode", episode, "not found.",
+      "Available:", episodes.map((e) => e.number).slice(0, 10).join(", "), "...",
+    );
+    return null;
+  }
+
+  console.log("[AnimePahe] Found episode", ep.number, "| session:", ep.session);
+
+  // ── Step 3: Get Sources ─────────────────────────────────────
+  let sources: PaheSource[];
+
   try {
-    // Search by title in the Kitsu catalog
-    const searchUrl = `${ANIME_KITSU_BASE}/catalog/anime/kitsu-anime-list/search=${slugify(title)}.json`;
-
-    console.log("[Kitsu] Searching:", searchUrl);
-
-    const catalog = await fetchJson<{
-      metas?: Array<{ id: string; name: string; }>;
-    }>(searchUrl);
-
-    const meta = catalog.metas?.[0];
-    if (!meta?.id) {
-      console.log("[Kitsu] No results");
-      return null;
-    }
-
-    console.log("[Kitsu] Found:", meta.id, meta.name);
-
-    // Kitsu stream format
-    const streamUrl = `${ANIME_KITSU_BASE}/stream/anime/series/${
-      encodeURIComponent(meta.id)
-    }:1:${episode}.json`;
-
-    const data = await fetchJson<{ streams?: StremioStream[] }>(streamUrl);
-    const stream = pickBestStream(data.streams ?? []);
-
-    if (!stream?.url) return null;
-
-    console.log("[Kitsu] ✓ Got stream");
-
-    return {
-      url:       stream.url,
-      subtitles: extractSubtitles(stream),
-      intro:     null,
-      outro:     null,
-      source:    "Anime Kitsu",
-    };
+    sources = await fetchJson<PaheSource[]>(
+      `${PAHE_API}/sources` +
+      `?anime_session=${best.session}` +
+      `&episode_session=${ep.session}`,
+    );
   } catch (err: any) {
-    console.warn("[Kitsu] Failed:", err.message);
+    console.error("[AnimePahe] Sources fetch failed:", err.message);
     return null;
   }
-}
 
-// ─── Provider 3: Direct Consumet API ──────────────────────────
-// Fallback: hit consumet.org REST API directly (not stremio addon)
-const CONSUMET_API =
-  process.env.CONSUMET_API_URL || "https://api.consumet.org";
+  if (!sources?.length) {
+    console.log("[AnimePahe] No sources returned");
+    return null;
+  }
 
-async function tryConsometDirect(
-  title:   string,
-  episode: number,
-  lang:    "sub" | "dub",
-): Promise<StreamResponse | null> {
+  console.log(
+    "[AnimePahe] Sources:",
+    sources.map((s) => `${s.quality}(${s.audio})`).join(", "),
+  );
+
+  // Pick best source
+  const source = pickSource(sources, lang);
+
+  if (!source) {
+    console.log("[AnimePahe] No suitable source found");
+    return null;
+  }
+
+  console.log("[AnimePahe] Picked source:", source.quality, source.audio, source.url);
+
+  // ── Step 4: Resolve M3U8 from Kwik ─────────────────────────
+  let m3u8Data: PaheM3u8Result;
+
   try {
-    // Search anime
-    const searchUrl = `${CONSUMET_API}/anime/gogoanime/${encodeURIComponent(title)}`;
-    console.log("[Consumet-Direct] Searching:", searchUrl);
-
-    const search = await fetchJson<{
-      results?: Array<{
-        id:    string;
-        title: string;
-        url:   string;
-        subOrDub?: string;
-      }>;
-    }>(searchUrl);
-
-    if (!search.results?.length) return null;
-
-    // Find sub or dub version
-    const result =
-      search.results.find(
-        (r) =>
-          r.subOrDub === lang &&
-          r.title.toLowerCase().includes(title.toLowerCase().slice(0, 10))
-      ) || search.results[0];
-
-    console.log("[Consumet-Direct] Using:", result.id);
-
-    // Fetch episode list
-    const infoUrl = `${CONSUMET_API}/anime/gogoanime/info/${encodeURIComponent(result.id)}`;
-    const info    = await fetchJson<{
-      episodes?: Array<{ id: string; number: number; }>;
-    }>(infoUrl);
-
-    const ep = info.episodes?.find((e) => e.number === episode);
-    if (!ep) {
-      console.log("[Consumet-Direct] Episode not found");
-      return null;
-    }
-
-    // Fetch stream sources
-    const sourceUrl = `${CONSUMET_API}/anime/gogoanime/watch/${encodeURIComponent(ep.id)}?server=vidstreaming`;
-    console.log("[Consumet-Direct] Fetching sources:", sourceUrl);
-
-    const sources = await fetchJson<{
-      sources?:   Array<{ url: string; quality: string; isM3U8: boolean; }>;
-      subtitles?: Array<{ url: string; lang: string; }>;
-      intro?:     { start: number; end: number; };
-      outro?:     { start: number; end: number; };
-    }>(sourceUrl);
-
-    if (!sources.sources?.length) return null;
-
-    // Pick best quality
-    const ordered = [...(sources.sources)].sort((a, b) => {
-      const order = ["1080p", "720p", "480p", "360p", "default", "backup"];
-      return order.indexOf(a.quality) - order.indexOf(b.quality);
-    });
-
-    const best = ordered[0];
-    console.log("[Consumet-Direct] ✓ Got stream:", best.quality);
-
-    return {
-      url:       best.url,
-      subtitles: (sources.subtitles ?? []).map((s, i) => ({
-        url:   s.url,
-        lang:  s.lang,
-        label: s.lang || `Track ${i + 1}`,
-      })),
-      intro:  sources.intro  ?? null,
-      outro:  sources.outro  ?? null,
-      source: `Consumet Direct (${best.quality})`,
-    };
+    m3u8Data = await fetchJson<PaheM3u8Result>(
+      `${PAHE_API}/m3u8?url=${encodeURIComponent(source.url)}`,
+    );
   } catch (err: any) {
-    console.warn("[Consumet-Direct] Failed:", err.message);
+    console.error("[AnimePahe] M3U8 resolve failed:", err.message);
     return null;
   }
-}
 
-// ─── Provider 4: Zoro / Aniwatch via Consumet ─────────────────
-async function tryZoro(
-  title:   string,
-  episode: number,
-): Promise<StreamResponse | null> {
-  try {
-    const searchUrl = `${CONSUMET_API}/anime/zoro/${encodeURIComponent(title)}`;
-    console.log("[Zoro] Searching:", searchUrl);
-
-    const search = await fetchJson<{
-      results?: Array<{ id: string; title: string; }>;
-    }>(searchUrl);
-
-    if (!search.results?.length) return null;
-
-    const result = search.results[0];
-    const infoUrl = `${CONSUMET_API}/anime/zoro/info?id=${encodeURIComponent(result.id)}`;
-
-    const info = await fetchJson<{
-      episodes?: Array<{ id: string; number: number; episodeId?: string; }>;
-    }>(infoUrl);
-
-    const ep = info.episodes?.find((e) => e.number === episode);
-    if (!ep) return null;
-
-    const epId = ep.episodeId ?? ep.id;
-    const srcUrl = `${CONSUMET_API}/anime/zoro/watch?episodeId=${encodeURIComponent(epId)}`;
-    console.log("[Zoro] Fetching:", srcUrl);
-
-    const sources = await fetchJson<{
-      sources?:   Array<{ url: string; quality: string; isM3U8: boolean; }>;
-      subtitles?: Array<{ url: string; lang: string; }>;
-      intro?:     { start: number; end: number; };
-      outro?:     { start: number; end: number; };
-    }>(srcUrl);
-
-    if (!sources.sources?.length) return null;
-
-    // Prefer HLS streams
-    const hlsSources = sources.sources.filter((s) => s.isM3U8);
-    const best       = hlsSources[0] ?? sources.sources[0];
-
-    console.log("[Zoro] ✓ Got stream");
-
-    return {
-      url:       best.url,
-      subtitles: (sources.subtitles ?? []).map((s, i) => ({
-        url:   s.url,
-        lang:  s.lang,
-        label: s.lang || `Track ${i + 1}`,
-      })),
-      intro:  sources.intro ?? null,
-      outro:  sources.outro ?? null,
-      source: "Zoro/Aniwatch",
-    };
-  } catch (err: any) {
-    console.warn("[Zoro] Failed:", err.message);
+  if (!m3u8Data?.m3u8) {
+    console.log("[AnimePahe] No M3U8 URL in response");
     return null;
   }
+
+  console.log("[AnimePahe] ✓ Got M3U8:", m3u8Data.m3u8.slice(0, 70) + "…");
+
+  return {
+    url:       m3u8Data.m3u8,
+    subtitles: [],           // AnimePahe uses hardcoded subs in the stream
+    intro:     null,
+    outro:     null,
+    source:    `AnimePahe (${source.quality} · ${source.audio === "eng" ? "Dub" : "Sub"})`,
+    referer:   m3u8Data.referer,
+    headers:   m3u8Data.headers,
+  };
 }
 
-// ─── Main Handler ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// MAIN HANDLER
+// ═══════════════════════════════════════════════════════════════
 export default async function handler(
-  req:  VercelRequest,
-  res:  VercelResponse,
+  req: VercelRequest,
+  res: VercelResponse,
 ) {
-  // CORS
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "GET")     return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "GET")
+    return res.status(405).json({ error: "Method not allowed" });
 
-  const { title, episode, lang, malId } = req.query;
+  const { title, episode, lang } = req.query;
 
   if (!title || typeof title !== "string") {
     return res.status(400).json({ error: "title is required" });
@@ -396,33 +301,23 @@ export default async function handler(
 
   const ep    = parseInt(String(episode || "1")) || 1;
   const audio = (lang === "dub" ? "dub" : "sub") as "sub" | "dub";
-  const mid   = malId ? parseInt(String(malId)) : undefined;
 
-  console.log(`\n[stream] title="${title}" ep=${ep} lang=${audio} malId=${mid}`);
+  console.log(`\n[stream] title="${title}" ep=${ep} lang=${audio}`);
 
-  // Try each provider in sequence — stop on first success
-  const providers = [
-    () => tryConsometDirect(title, ep, audio),
-    () => tryZoro(title, ep),
-    () => tryConsometStremio(title, ep, audio),
-    () => tryAnimeKitsu(title, ep, mid),
-  ];
+  const result = await streamFromAnimePahe(title, ep, audio);
 
-  for (const provider of providers) {
-    const result = await provider();
-    if (result?.url) {
-      console.log(`[stream] ✓ Success from: ${result.source}`);
-      return res.status(200).json(result);
-    }
+  if (result?.url) {
+    console.log("[stream] ✓ Success:", result.source);
+    return res.status(200).json(result);
   }
 
-  console.log("[stream] ✗ All providers failed");
+  console.log("[stream] ✗ Failed — no stream found");
   return res.status(200).json({
     url:       null,
     subtitles: [],
     intro:     null,
     outro:     null,
     source:    null,
-    error:     "No stream found across all providers",
+    error:     "No stream found on AnimePahe for this title/episode",
   });
 }
