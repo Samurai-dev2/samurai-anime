@@ -2,24 +2,25 @@
 import { useState, useEffect } from "react";
 
 export interface SubtitleTrack {
-  url:    string;
-  lang:   string;
-  label?: string;
+  url:   string;
+  lang:  string;
+  label: string;
 }
 
-export interface IntroOutro {
-  start: number;
-  end:   number;
+export interface StreamHeaders {
+  referer?: string;
+  headers?: Record<string, string>;
 }
 
 interface StreamResult {
-  streamUrl:    string | null;
-  subtitles:    SubtitleTrack[];
-  loading:      boolean;
-  error:        string | null;
-  intro:        IntroOutro | null;
-  outro:        IntroOutro | null;
-  sourceLabel:  string | null;
+  streamUrl:     string | null;
+  subtitles:     SubtitleTrack[];
+  streamHeaders: StreamHeaders;
+  loading:       boolean;
+  error:         string | null;
+  intro:         null;
+  outro:         null;
+  sourceLabel:   string | null;
 }
 
 export function useStreamUrl(
@@ -28,13 +29,12 @@ export function useStreamUrl(
   lang:    "sub" | "dub",
   malId?:  number,
 ): StreamResult {
-  const [streamUrl,   setStreamUrl]   = useState<string | null>(null);
-  const [subtitles,   setSubtitles]   = useState<SubtitleTrack[]>([]);
-  const [loading,     setLoading]     = useState(false);
-  const [error,       setError]       = useState<string | null>(null);
-  const [intro,       setIntro]       = useState<IntroOutro | null>(null);
-  const [outro,       setOutro]       = useState<IntroOutro | null>(null);
-  const [sourceLabel, setSourceLabel] = useState<string | null>(null);
+  const [streamUrl,     setStreamUrl]     = useState<string | null>(null);
+  const [subtitles,     setSubtitles]     = useState<SubtitleTrack[]>([]);
+  const [streamHeaders, setStreamHeaders] = useState<StreamHeaders>({});
+  const [loading,       setLoading]       = useState(false);
+  const [error,         setError]         = useState<string | null>(null);
+  const [sourceLabel,   setSourceLabel]   = useState<string | null>(null);
 
   useEffect(() => {
     if (!title) return;
@@ -46,8 +46,7 @@ export function useStreamUrl(
       setError(null);
       setStreamUrl(null);
       setSubtitles([]);
-      setIntro(null);
-      setOutro(null);
+      setStreamHeaders({});
       setSourceLabel(null);
 
       try {
@@ -68,20 +67,20 @@ export function useStreamUrl(
         const data = await res.json();
 
         if (!cancelled) {
-          setStreamUrl(data.url         ?? null);
-          setSubtitles(data.subtitles   ?? []);
-          setIntro(    data.intro       ?? null);
-          setOutro(    data.outro       ?? null);
-          setSourceLabel(data.source    ?? null);
+          setStreamUrl(   data.url      ?? null);
+          setSubtitles(   data.subtitles ?? []);
+          setSourceLabel( data.source   ?? null);
+          setStreamHeaders({
+            referer: data.referer,
+            headers: data.headers,
+          });
 
           if (!data.url) {
-            setError("No stream URL returned");
+            setError(data.error ?? "No stream URL returned");
           }
         }
       } catch (err: any) {
-        if (!cancelled) {
-          setError(err.message ?? "Unknown error");
-        }
+        if (!cancelled) setError(err.message ?? "Unknown error");
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -91,5 +90,14 @@ export function useStreamUrl(
     return () => { cancelled = true; };
   }, [title, episode, lang, malId]);
 
-  return { streamUrl, subtitles, loading, error, intro, outro, sourceLabel };
+  return {
+    streamUrl,
+    subtitles,
+    streamHeaders,
+    loading,
+    error,
+    intro:       null,
+    outro:       null,
+    sourceLabel,
+  };
 }
