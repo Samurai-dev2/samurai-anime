@@ -14,11 +14,11 @@ there is featured anime contunue watching (currently glitched to show certain an
 <ul>
 Comments<br>
 No ads (already tried implementing just doesnt work)<br>
-Reactions (Like button/ Dislike button)<br>
 </ul>
 <h1>UPDATES</h1>
 <ul>
   Added Login/Signup
+  Reactions (Like button/ Dislike button)<br>
 </ul>
 
 <h1>Special Thanks to...</h1>
