@@ -3,6 +3,9 @@
     "api/stream.ts": {
       "maxDuration": 30
     },
+    "api/proxy.ts": {
+      "maxDuration": 30
+    },
     "api/reactions.ts": {
       "maxDuration": 10
     }
@@ -11,6 +14,10 @@
     {
       "source": "/api/stream",
       "destination": "/api/stream"
+    },
+    {
+      "source": "/api/proxy",
+      "destination": "/api/proxy"
     },
     {
       "source": "/api/reactions",
