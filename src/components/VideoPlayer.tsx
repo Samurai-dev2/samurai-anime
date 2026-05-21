@@ -13,6 +13,7 @@ interface VideoPlayerProps {
   subtitles?: Subtitle[];
   poster?:    string;
   title?:     string;
+  referer?:   string;   // ← new: needed for AnimePahe/Kwik streams
 }
 
 // ── Load scripts from CDN so we dont need npm packages ─────
@@ -42,13 +43,10 @@ function loadStylesheet(id: string, href: string): void {
 }
 
 async function loadPlyrAndHls(): Promise<{ Plyr: any; Hls: any }> {
-  // inject Plyr CSS
   loadStylesheet(
     "plyr-css",
     "https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css"
   );
-
-  // load HLS.js first then Plyr
   await loadScript(
     "hls-script",
     "https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"
@@ -57,7 +55,6 @@ async function loadPlyrAndHls(): Promise<{ Plyr: any; Hls: any }> {
     "plyr-script",
     "https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.min.js"
   );
-
   return {
     Plyr: (window as any).Plyr,
     Hls:  (window as any).Hls,
@@ -69,6 +66,7 @@ export default function VideoPlayer({
   subtitles = [],
   poster,
   title,
+  referer,    // ← destructure new prop
 }: VideoPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef     = useRef<HTMLVideoElement>(null);
@@ -86,7 +84,6 @@ export default function VideoPlayer({
     setError(null);
     setLoading(true);
 
-    // destroy previous instances
     if (plyrRef.current) {
       plyrRef.current.destroy();
       plyrRef.current = null;
@@ -103,13 +100,19 @@ export default function VideoPlayer({
 
         const video = videoRef.current;
 
-        // ── Set up HLS if it's an m3u8 stream ──────────────
+        // ── Set up HLS ──────────────────────────────────────
         if (streamUrl.includes(".m3u8") && Hls.isSupported()) {
           const hls = new Hls({
             enableWorker: false,
-            // these headers tell the CDN we're a browser
-            xhrSetup: (xhr: XMLHttpRequest) => {
+            // ↓ Only change: pass referer in xhrSetup if we have one
+            xhrSetup: (xhr: XMLHttpRequest, url: string) => {
               xhr.setRequestHeader("Accept", "*/*");
+              // AnimePahe/Kwik streams require a Referer header
+              // We send it as a custom header — your scraper's
+              // proxy endpoint handles the actual referer forwarding
+              if (referer) {
+                xhr.setRequestHeader("X-Referer", referer);
+              }
             },
           });
 
@@ -134,7 +137,6 @@ export default function VideoPlayer({
           // Safari native HLS
           video.src = streamUrl;
           setLoading(false);
-
         } else {
           // plain MP4 or direct URL
           video.src = streamUrl;
@@ -171,33 +173,29 @@ export default function VideoPlayer({
           },
           poster: poster || undefined,
           autoplay: false,
-          // custom theme matching your site
           i18n: {
-            play: "Play",
+            play:  "Play",
             pause: "Pause",
           },
         });
 
         plyrRef.current = player;
 
-        // quality switching through HLS
+        // ── Quality switching through HLS ────────────────────
         if (hlsRef.current) {
           const hls = hlsRef.current;
 
-          // expose quality levels to Plyr
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            const availableQualities = hls.levels.map(
-              (l: any) => l.height
-            );
+            const availableQualities = hls.levels.map((l: any) => l.height);
             availableQualities.unshift(0); // 0 = auto
 
             player.config.quality = {
-              default: 0,
-              options: availableQualities,
-              forced:  true,
+              default:  0,
+              options:  availableQualities,
+              forced:   true,
               onChange: (newQuality: number) => {
                 if (newQuality === 0) {
-                  hls.currentLevel = -1; // auto
+                  hls.currentLevel = -1;
                 } else {
                   hls.levels.forEach((level: any, idx: number) => {
                     if (level.height === newQuality) {
@@ -233,7 +231,7 @@ export default function VideoPlayer({
         hlsRef.current = null;
       }
     };
-  }, [streamUrl, poster, title]);
+  }, [streamUrl, poster, title, referer]); // ← add referer to deps
 
   return (
     <div className="relative w-full rounded-2xl overflow-hidden ring-1 ring-white/10 shadow-2xl shadow-black/60 bg-black">
@@ -259,24 +257,22 @@ export default function VideoPlayer({
         </div>
       )}
 
-      {/* video element — Plyr wraps this */}
+      {/* video element */}
       {!error && (
         <div
           ref={containerRef}
           className="aspect-video w-full"
-          // override Plyr default theme with your red accent
           style={{
-            // Plyr uses CSS variables for theming
-            "--plyr-color-main":               "#dc2626",
-            "--plyr-video-background":         "#000",
-            "--plyr-menu-background":          "#18181b",
-            "--plyr-menu-color":               "#fff",
-            "--plyr-menu-border-color":        "#27272a",
-            "--plyr-control-icon-size":        "18px",
-            "--plyr-font-size-base":           "14px",
-            "--plyr-tooltip-background":       "#18181b",
-            "--plyr-tooltip-color":            "#fff",
-            "--plyr-badge-background":         "#dc2626",
+            "--plyr-color-main":        "#dc2626",
+            "--plyr-video-background":  "#000",
+            "--plyr-menu-background":   "#18181b",
+            "--plyr-menu-color":        "#fff",
+            "--plyr-menu-border-color": "#27272a",
+            "--plyr-control-icon-size": "18px",
+            "--plyr-font-size-base":    "14px",
+            "--plyr-tooltip-background":"#18181b",
+            "--plyr-tooltip-color":     "#fff",
+            "--plyr-badge-background":  "#dc2626",
           } as React.CSSProperties}
         >
           <video
@@ -285,7 +281,6 @@ export default function VideoPlayer({
             crossOrigin="anonymous"
             playsInline
           >
-            {/* subtitle tracks */}
             {subtitles.map((sub) => (
               <track
                 key={sub.lang}
