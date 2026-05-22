@@ -20,38 +20,56 @@ function isAllowedUrl(url: string): boolean {
   }
 }
 
-// Rewrite m3u8 — segment URLs must be ABSOLUTE so HLS.js
-// resolves them correctly even when loaded from a Blob URL
 function rewriteM3u8(
-  content:  string,
-  baseUrl:  string,
-  referer:  string,
-  origin:   string,   // e.g. "https://samurai-anime-nine.vercel.app"
+  content: string,
+  baseUrl: string,
+  referer: string,
+  origin:  string,
 ): string {
   const base       = new URL(baseUrl);
   const encodedRef = encodeURIComponent(referer);
+
+  function toProxyUrl(rawUrl: string): string {
+    // Resolve relative → absolute
+    let absolute: string;
+    try {
+      absolute = new URL(rawUrl, base).toString();
+    } catch {
+      return rawUrl;
+    }
+    if (!absolute.startsWith("http")) return rawUrl;
+    return `${origin}/api/proxy?url=${encodeURIComponent(absolute)}&referer=${encodedRef}`;
+  }
 
   return content
     .split("\n")
     .map((line) => {
       const trimmed = line.trim();
+      if (!trimmed) return line;
 
-      // Skip comments and empty lines
-      if (!trimmed || trimmed.startsWith("#")) return line;
-
-      // Resolve relative → absolute CDN URL
-      let absoluteUrl: string;
-      try {
-        absoluteUrl = new URL(trimmed, base).toString();
-      } catch {
-        return line;
+      // ── Rewrite #EXT-X-KEY URI ──────────────────────────
+      // e.g. #EXT-X-KEY:METHOD=AES-128,URI="https://vault.../mon.key",IV=0x...
+      if (trimmed.startsWith("#EXT-X-KEY")) {
+        return line.replace(
+          /URI="([^"]+)"/,
+          (_, keyUrl) => `URI="${toProxyUrl(keyUrl)}"`,
+        );
       }
 
-      if (!absoluteUrl.startsWith("http")) return line;
+      // ── Rewrite #EXT-X-MAP URI ───────────────────────────
+      // e.g. #EXT-X-MAP:URI="init.mp4"
+      if (trimmed.startsWith("#EXT-X-MAP")) {
+        return line.replace(
+          /URI="([^"]+)"/,
+          (_, mapUrl) => `URI="${toProxyUrl(mapUrl)}"`,
+        );
+      }
 
-      // ↓ Use FULL absolute URL including origin
-      // so HLS.js resolves correctly from a Blob URL context
-      return `${origin}/api/proxy?url=${encodeURIComponent(absoluteUrl)}&referer=${encodedRef}`;
+      // ── Skip all other # lines ───────────────────────────
+      if (trimmed.startsWith("#")) return line;
+
+      // ── Rewrite segment / sub-playlist URLs ──────────────
+      return toProxyUrl(trimmed);
     })
     .join("\n");
 }
@@ -75,10 +93,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(403).json({ error: "Host not allowed" });
   }
 
-  // Detect our own origin from the request
-  // e.g. "https://samurai-anime-nine.vercel.app"
   const origin =
-    req.headers.origin ||
+    (req.headers.origin as string) ||
     `https://${req.headers.host}` ||
     "https://samurai-anime-nine.vercel.app";
 
@@ -96,28 +112,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     if (!upstream.ok) {
-      return res.status(upstream.status).json({
-        error: `Upstream ${upstream.status}`,
-      });
+      console.error("[proxy] Upstream error:", upstream.status, url);
+      return res.status(upstream.status).json({ error: `Upstream ${upstream.status}` });
     }
 
     const contentType = upstream.headers.get("content-type") || "application/octet-stream";
-    const isM3u8      =
-      url.includes(".m3u8") ||
-      contentType.includes("mpegurl") ||
+
+    const isM3u8 =
+      url.includes(".m3u8")              ||
+      contentType.includes("mpegurl")    ||
       contentType.includes("x-mpegURL");
 
+    // ── M3U8 playlist — rewrite all URLs ─────────────────
     if (isM3u8) {
       const text      = await upstream.text();
-      // Pass origin so rewritten URLs are absolute
-      const rewritten = rewriteM3u8(text, url, ref, origin as string);
+      const rewritten = rewriteM3u8(text, url, ref, origin);
+
+      console.log("[proxy] Serving rewritten m3u8 for:", url.slice(0, 60));
 
       res.setHeader("Content-Type",  "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache");
       return res.status(200).send(rewritten);
     }
 
-    // Binary segments (.ts files, .jpg chunks, etc.)
+    // ── .key files — serve as binary ─────────────────────
+    // AES-128 key files are small binary blobs
+    const isKey = url.includes(".key") || url.endsWith("mon.key");
+
+    if (isKey) {
+      const buffer = await upstream.arrayBuffer();
+      console.log("[proxy] Serving key file:", url.slice(0, 60));
+      res.setHeader("Content-Type",  "application/octet-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.writeHead(200, {
+        "Content-Type":  "application/octet-stream",
+        "Cache-Control": "no-cache",
+      });
+      return res.end(Buffer.from(buffer));
+    }
+
+    // ── Binary segments (.ts, .jpg chunks, etc.) ─────────
     const buffer = await upstream.arrayBuffer();
 
     const forwardHeaders: Record<string, string> = {
