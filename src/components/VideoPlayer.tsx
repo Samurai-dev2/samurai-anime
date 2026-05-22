@@ -13,16 +13,12 @@ interface VideoPlayerProps {
   subtitles?: Subtitle[];
   poster?:    string;
   title?:     string;
-  referer?:   string;   // ← new: needed for AnimePahe/Kwik streams
+  referer?:   string;
 }
 
-// ── Load scripts from CDN so we dont need npm packages ─────
 function loadScript(id: string, src: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (document.getElementById(id)) {
-      resolve();
-      return;
-    }
+    if (document.getElementById(id)) { resolve(); return; }
     const script    = document.createElement("script");
     script.id       = id;
     script.src      = src;
@@ -66,12 +62,13 @@ export default function VideoPlayer({
   subtitles = [],
   poster,
   title,
-  referer,    // ← destructure new prop
+  referer,
 }: VideoPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const videoRef     = useRef<HTMLVideoElement>(null);
   const plyrRef      = useRef<any>(null);
   const hlsRef       = useRef<any>(null);
+  const blobUrlRef   = useRef<string | null>(null);  // ← track blob URL for cleanup
 
   const [error,   setError]   = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -84,13 +81,14 @@ export default function VideoPlayer({
     setError(null);
     setLoading(true);
 
-    if (plyrRef.current) {
-      plyrRef.current.destroy();
-      plyrRef.current = null;
-    }
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
+    // Destroy previous instances
+    if (plyrRef.current) { plyrRef.current.destroy(); plyrRef.current = null; }
+    if (hlsRef.current)  { hlsRef.current.destroy();  hlsRef.current  = null; }
+
+    // Revoke previous blob URL
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
     }
 
     async function init() {
@@ -100,94 +98,109 @@ export default function VideoPlayer({
 
         const video = videoRef.current;
 
-        // ── Set up HLS ──────────────────────────────────────
-        if (streamUrl.includes(".m3u8") && Hls.isSupported()) {
+        // ── Determine the actual URL to feed HLS.js ──────────
+        // If it's our /api/proxy URL (serves m3u8 with rewritten segments),
+        // fetch it → create a Blob URL → HLS.js can load that fine
+        let hlsUrl = streamUrl;
+
+        const isProxyM3u8 =
+          streamUrl.startsWith("/api/proxy") ||
+          streamUrl.startsWith("data:application/vnd.apple.mpegurl");
+
+        if (isProxyM3u8 && streamUrl.startsWith("/api/proxy")) {
+          try {
+            console.log("[VideoPlayer] Fetching proxied m3u8…");
+
+            const res = await fetch(streamUrl);
+            if (!res.ok) throw new Error(`Proxy returned ${res.status}`);
+
+            const m3u8Text = await res.text();
+
+            // Create a Blob URL — HLS.js handles this perfectly
+            const blob     = new Blob([m3u8Text], { type: "application/vnd.apple.mpegurl" });
+            const blobUrl  = URL.createObjectURL(blob);
+            blobUrlRef.current = blobUrl;
+            hlsUrl             = blobUrl;
+
+            console.log("[VideoPlayer] Blob URL created:", blobUrl.slice(0, 40));
+          } catch (err: any) {
+            console.warn("[VideoPlayer] Blob creation failed, using URL directly:", err.message);
+            // Fall through — use streamUrl directly
+          }
+        }
+
+        // ── Set up HLS.js ────────────────────────────────────
+        if (Hls.isSupported()) {
           const hls = new Hls({
-            enableWorker: false,
-            // ↓ Only change: pass referer in xhrSetup if we have one
-            xhrSetup: (xhr: XMLHttpRequest, url: string) => {
-              xhr.setRequestHeader("Accept", "*/*");
-              // AnimePahe/Kwik streams require a Referer header
-              // We send it as a custom header — your scraper's
-              // proxy endpoint handles the actual referer forwarding
-              if (referer) {
-                xhr.setRequestHeader("X-Referer", referer);
-              }
-            },
+            enableWorker:    true,
+            // No special headers needed — segments go through /api/proxy
+            // which already adds Referer server-side
+            maxBufferLength: 30,
+            maxBufferSize:   60 * 1000 * 1000,
           });
 
           hlsRef.current = hls;
 
           hls.on(Hls.Events.ERROR, (_: any, data: any) => {
             if (data.fatal && !cancelled) {
-              setError("Stream failed to load. Try switching to fallback.");
+              console.error("[HLS] Fatal error:", data.type, data.details);
+              setError("Stream failed to load. The source may be unavailable.");
               setLoading(false);
             }
           });
 
-          hls.loadSource(streamUrl);
+          hls.loadSource(hlsUrl);
           hls.attachMedia(video);
 
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (cancelled) return;
+            console.log("[HLS] Manifest parsed ✓");
             setLoading(false);
           });
 
         } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
           // Safari native HLS
-          video.src = streamUrl;
+          video.src = hlsUrl;
           setLoading(false);
         } else {
-          // plain MP4 or direct URL
-          video.src = streamUrl;
+          video.src = hlsUrl;
           setLoading(false);
         }
 
-        // ── Initialize Plyr ─────────────────────────────────
+        // ── Initialize Plyr ──────────────────────────────────
         const player = new Plyr(video, {
-          title: title || "Anime",
+          title:    title || "Anime",
           controls: [
-            "play-large",
-            "play",
-            "rewind",
-            "fast-forward",
-            "progress",
-            "current-time",
-            "duration",
-            "mute",
-            "volume",
-            "captions",
-            "settings",
-            "pip",
-            "fullscreen",
+            "play-large", "play", "rewind", "fast-forward",
+            "progress", "current-time", "duration",
+            "mute", "volume", "captions", "settings", "pip", "fullscreen",
           ],
           settings: ["captions", "quality", "speed"],
           speed: {
             selected: 1,
-            options: [0.5, 0.75, 1, 1.25, 1.5, 2],
+            options:  [0.5, 0.75, 1, 1.25, 1.5, 2],
           },
           captions: {
-            active: subtitles.length > 0,
+            active:   subtitles.length > 0,
             language: "en",
-            update: true,
+            update:   true,
           },
-          poster: poster || undefined,
+          poster:   poster || undefined,
           autoplay: false,
-          i18n: {
-            play:  "Play",
-            pause: "Pause",
-          },
+          i18n:     { play: "Play", pause: "Pause" },
         });
 
         plyrRef.current = player;
 
-        // ── Quality switching through HLS ────────────────────
+        // ── Wire quality levels to Plyr settings ─────────────
         if (hlsRef.current) {
           const hls = hlsRef.current;
 
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (cancelled) return;
+
             const availableQualities = hls.levels.map((l: any) => l.height);
-            availableQualities.unshift(0); // 0 = auto
+            availableQualities.unshift(0); // 0 = Auto
 
             player.config.quality = {
               default:  0,
@@ -195,12 +208,10 @@ export default function VideoPlayer({
               forced:   true,
               onChange: (newQuality: number) => {
                 if (newQuality === 0) {
-                  hls.currentLevel = -1;
+                  hls.currentLevel = -1; // Auto
                 } else {
                   hls.levels.forEach((level: any, idx: number) => {
-                    if (level.height === newQuality) {
-                      hls.currentLevel = idx;
-                    }
+                    if (level.height === newQuality) hls.currentLevel = idx;
                   });
                 }
               },
@@ -222,21 +233,19 @@ export default function VideoPlayer({
 
     return () => {
       cancelled = true;
-      if (plyrRef.current) {
-        plyrRef.current.destroy();
-        plyrRef.current = null;
-      }
-      if (hlsRef.current) {
-        hlsRef.current.destroy();
-        hlsRef.current = null;
+      if (plyrRef.current) { plyrRef.current.destroy(); plyrRef.current = null; }
+      if (hlsRef.current)  { hlsRef.current.destroy();  hlsRef.current  = null; }
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
       }
     };
-  }, [streamUrl, poster, title, referer]); // ← add referer to deps
+  }, [streamUrl, poster, title, referer]);
 
   return (
     <div className="relative w-full rounded-2xl overflow-hidden ring-1 ring-white/10 shadow-2xl shadow-black/60 bg-black">
 
-      {/* loading overlay */}
+      {/* Loading overlay */}
       {loading && !error && (
         <div className="absolute inset-0 flex items-center justify-center bg-black z-20 aspect-video">
           <div className="flex flex-col items-center gap-3">
@@ -246,7 +255,7 @@ export default function VideoPlayer({
         </div>
       )}
 
-      {/* error state */}
+      {/* Error state */}
       {error && (
         <div className="flex items-center justify-center bg-zinc-900 aspect-video">
           <div className="text-center px-6">
@@ -257,22 +266,22 @@ export default function VideoPlayer({
         </div>
       )}
 
-      {/* video element */}
+      {/* Video element */}
       {!error && (
         <div
           ref={containerRef}
           className="aspect-video w-full"
           style={{
-            "--plyr-color-main":        "#dc2626",
-            "--plyr-video-background":  "#000",
-            "--plyr-menu-background":   "#18181b",
-            "--plyr-menu-color":        "#fff",
-            "--plyr-menu-border-color": "#27272a",
-            "--plyr-control-icon-size": "18px",
-            "--plyr-font-size-base":    "14px",
-            "--plyr-tooltip-background":"#18181b",
-            "--plyr-tooltip-color":     "#fff",
-            "--plyr-badge-background":  "#dc2626",
+            "--plyr-color-main":         "#dc2626",
+            "--plyr-video-background":   "#000",
+            "--plyr-menu-background":    "#18181b",
+            "--plyr-menu-color":         "#fff",
+            "--plyr-menu-border-color":  "#27272a",
+            "--plyr-control-icon-size":  "18px",
+            "--plyr-font-size-base":     "14px",
+            "--plyr-tooltip-background": "#18181b",
+            "--plyr-tooltip-color":      "#fff",
+            "--plyr-badge-background":   "#dc2626",
           } as React.CSSProperties}
         >
           <video
