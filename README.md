@@ -11,10 +11,7 @@ This project uses the jikan api then uses a mapper to convert from a MAL id to a
 there is featured anime contunue watching (currently glitched to show certain animes) <br>
 # Known Glitches
 <ul>
-  The Dub/Sub doesnt work for some reason<br>
-  Movies dont work (its an easy fix i am just too lazy to fix it)<br>
-  If you refresh in the watch pages it says page not found<br>
-  Bleach doesnt work as its mixed up with jojos bizzare adventure<br>
+<li> For some reason if you watch an anime thats in season 2 it wont work plan to fix it in 1.0.1</li>
 </ul>
 <h1> Future Plans</h1>
 <ul>
@@ -22,7 +19,7 @@ Comments<br>
 </ul>
 <h1>UPDATES</h1>
 <ul>
-  Added Login/Signup
+  Added Login/Signup<br>
   Reactions (Like button/ Dislike button)<br>
   No ads<br>
 </ul>
