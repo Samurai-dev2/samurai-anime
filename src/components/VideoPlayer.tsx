@@ -68,7 +68,6 @@ export default function VideoPlayer({
   const videoRef     = useRef<HTMLVideoElement>(null);
   const plyrRef      = useRef<any>(null);
   const hlsRef       = useRef<any>(null);
-  const blobUrlRef   = useRef<string | null>(null);  // ← track blob URL for cleanup
 
   const [error,   setError]   = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -81,15 +80,8 @@ export default function VideoPlayer({
     setError(null);
     setLoading(true);
 
-    // Destroy previous instances
     if (plyrRef.current) { plyrRef.current.destroy(); plyrRef.current = null; }
     if (hlsRef.current)  { hlsRef.current.destroy();  hlsRef.current  = null; }
-
-    // Revoke previous blob URL
-    if (blobUrlRef.current) {
-      URL.revokeObjectURL(blobUrlRef.current);
-      blobUrlRef.current = null;
-    }
 
     async function init() {
       try {
@@ -98,45 +90,16 @@ export default function VideoPlayer({
 
         const video = videoRef.current;
 
-        // ── Determine the actual URL to feed HLS.js ──────────
-        // If it's our /api/proxy URL (serves m3u8 with rewritten segments),
-        // fetch it → create a Blob URL → HLS.js can load that fine
-        let hlsUrl = streamUrl;
+        console.log("[VideoPlayer] Loading:", streamUrl.slice(0, 80));
 
-        const isProxyM3u8 =
-          streamUrl.startsWith("/api/proxy") ||
-          streamUrl.startsWith("data:application/vnd.apple.mpegurl");
-
-        if (isProxyM3u8 && streamUrl.startsWith("/api/proxy")) {
-          try {
-            console.log("[VideoPlayer] Fetching proxied m3u8…");
-
-            const res = await fetch(streamUrl);
-            if (!res.ok) throw new Error(`Proxy returned ${res.status}`);
-
-            const m3u8Text = await res.text();
-
-            // Create a Blob URL — HLS.js handles this perfectly
-            const blob     = new Blob([m3u8Text], { type: "application/vnd.apple.mpegurl" });
-            const blobUrl  = URL.createObjectURL(blob);
-            blobUrlRef.current = blobUrl;
-            hlsUrl             = blobUrl;
-
-            console.log("[VideoPlayer] Blob URL created:", blobUrl.slice(0, 40));
-          } catch (err: any) {
-            console.warn("[VideoPlayer] Blob creation failed, using URL directly:", err.message);
-            // Fall through — use streamUrl directly
-          }
-        }
-
-        // ── Set up HLS.js ────────────────────────────────────
+        // ── HLS.js setup ─────────────────────────────────────
         if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker:    true,
-            // No special headers needed — segments go through /api/proxy
-            // which already adds Referer server-side
             maxBufferLength: 30,
             maxBufferSize:   60 * 1000 * 1000,
+            // Segments go through /api/proxy which adds headers server-side
+            // No xhrSetup needed
           });
 
           hlsRef.current = hls;
@@ -149,25 +112,27 @@ export default function VideoPlayer({
             }
           });
 
-          hls.loadSource(hlsUrl);
+          // Feed the /api/proxy URL directly — no Blob needed
+          // proxy rewrites segment URLs to absolute so HLS.js resolves correctly
+          hls.loadSource(streamUrl);
           hls.attachMedia(video);
 
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (cancelled) return;
-            console.log("[HLS] Manifest parsed ✓");
+            console.log("[HLS] ✓ Manifest parsed");
             setLoading(false);
           });
 
         } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
           // Safari native HLS
-          video.src = hlsUrl;
+          video.src = streamUrl;
           setLoading(false);
         } else {
-          video.src = hlsUrl;
+          video.src = streamUrl;
           setLoading(false);
         }
 
-        // ── Initialize Plyr ──────────────────────────────────
+        // ── Plyr ─────────────────────────────────────────────
         const player = new Plyr(video, {
           title:    title || "Anime",
           controls: [
@@ -192,23 +157,20 @@ export default function VideoPlayer({
 
         plyrRef.current = player;
 
-        // ── Wire quality levels to Plyr settings ─────────────
+        // ── Quality levels ────────────────────────────────────
         if (hlsRef.current) {
           const hls = hlsRef.current;
-
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (cancelled) return;
-
             const availableQualities = hls.levels.map((l: any) => l.height);
-            availableQualities.unshift(0); // 0 = Auto
-
+            availableQualities.unshift(0);
             player.config.quality = {
               default:  0,
               options:  availableQualities,
               forced:   true,
               onChange: (newQuality: number) => {
                 if (newQuality === 0) {
-                  hls.currentLevel = -1; // Auto
+                  hls.currentLevel = -1;
                 } else {
                   hls.levels.forEach((level: any, idx: number) => {
                     if (level.height === newQuality) hls.currentLevel = idx;
@@ -216,7 +178,6 @@ export default function VideoPlayer({
                 }
               },
             };
-
             player.quality = 0;
           });
         }
@@ -235,17 +196,12 @@ export default function VideoPlayer({
       cancelled = true;
       if (plyrRef.current) { plyrRef.current.destroy(); plyrRef.current = null; }
       if (hlsRef.current)  { hlsRef.current.destroy();  hlsRef.current  = null; }
-      if (blobUrlRef.current) {
-        URL.revokeObjectURL(blobUrlRef.current);
-        blobUrlRef.current = null;
-      }
     };
   }, [streamUrl, poster, title, referer]);
 
   return (
     <div className="relative w-full rounded-2xl overflow-hidden ring-1 ring-white/10 shadow-2xl shadow-black/60 bg-black">
 
-      {/* Loading overlay */}
       {loading && !error && (
         <div className="absolute inset-0 flex items-center justify-center bg-black z-20 aspect-video">
           <div className="flex flex-col items-center gap-3">
@@ -255,7 +211,6 @@ export default function VideoPlayer({
         </div>
       )}
 
-      {/* Error state */}
       {error && (
         <div className="flex items-center justify-center bg-zinc-900 aspect-video">
           <div className="text-center px-6">
@@ -266,7 +221,6 @@ export default function VideoPlayer({
         </div>
       )}
 
-      {/* Video element */}
       {!error && (
         <div
           ref={containerRef}
