@@ -7,8 +7,7 @@
 
 
 Ok so after 20 million years I am happy to announce this project in <strong>1.0</strong> <br>
-This project uses the jikan api then uses a mapper to convert from a MAL id to a Tmdb so VIDsrc and other APIs actually work.<br>
-there is featured anime contunue watching (currently glitched to show certain animes) <br>
+This project uses the jikan api then uses an API called animepahe api which scarpers the raw m3u8 files from Animepahe thus giving it no ads 
 # Known Glitches
 <ul>
 <li> For some reason if you watch an anime thats in season 2 it wont work plan to fix it in 1.0.1</li>
