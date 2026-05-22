@@ -2,7 +2,7 @@
   <img src="./public/images/samurai-logo.png" alt="Project Logo" width="200">
 </p>
 <div align="center">
-# Samurai Anime 1.o 🎌
+<h1> Samurai Anime 1.0 🎌</h1>
 </div>
 
 
