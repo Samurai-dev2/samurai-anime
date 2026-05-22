@@ -264,23 +264,28 @@ async function streamFromAnimePahe(
 
   console.log("[AnimePahe] ✓ Got M3U8:", m3u8Data.m3u8.slice(0, 70) + "…");
 
-  // ── Step 5: Fetch & rewrite the m3u8 through our proxy ─────
-  // This resolves the CORS issue — browser only ever hits /api/proxy
+ // ── Step 5: Return proxied URL ──────────────────────────────
+  // Instead of data URI (which HLS.js can't load),
+  // return a /api/proxy URL that serves the rewritten m3u8
   const referer = m3u8Data.referer || "https://kwik.cx/";
 
-  let m3u8Content: string;
-  try {
-    const m3u8Res = await withTimeout(
-      fetch(m3u8Data.m3u8, {
-        headers: {
-          "Referer":    referer,
-          "Origin":     "https://kwik.cx",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          "Accept":     "*/*",
-        },
-      }),
-      15_000,
-    );
+  // The proxy will fetch the m3u8, rewrite segment URLs, and return it
+  const proxyUrl =
+    `/api/proxy` +
+    `?url=${encodeURIComponent(m3u8Data.m3u8)}` +
+    `&referer=${encodeURIComponent(referer)}`;
+
+  console.log("[AnimePahe] ✓ Returning proxy URL:", proxyUrl);
+
+  return {
+    url:       proxyUrl,          // /api/proxy?url=...&referer=...
+    subtitles: [],
+    intro:     null,
+    outro:     null,
+    source:    `AnimePahe (${source.quality} · ${source.audio === "eng" ? "Dub" : "Sub"})`,
+    referer,
+    headers:   m3u8Data.headers,
+  };
 
     if (!m3u8Res.ok) throw new Error(`M3U8 fetch failed: ${m3u8Res.status}`);
     m3u8Content = await m3u8Res.text();
