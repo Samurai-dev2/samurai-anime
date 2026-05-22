@@ -120,35 +120,6 @@ function pickSource(sources: PaheSource[], lang: "sub" | "dub"): PaheSource | nu
   return pool[0];
 }
 
-// ── Rewrite m3u8 playlist so all segment URLs go through our proxy ──
-function rewriteM3u8(content: string, baseUrl: string, referer: string): string {
-  const base       = new URL(baseUrl);
-  const encodedRef = encodeURIComponent(referer);
-
-  return content
-    .split("\n")
-    .map((line) => {
-      const trimmed = line.trim();
-
-      // Skip comments and empty lines
-      if (!trimmed || trimmed.startsWith("#")) return line;
-
-      // Resolve relative → absolute URL
-      let absoluteUrl: string;
-      try {
-        absoluteUrl = new URL(trimmed, base).toString();
-      } catch {
-        return line;
-      }
-
-      if (!absoluteUrl.startsWith("http")) return line;
-
-      // Route through our proxy
-      return `/api/proxy?url=${encodeURIComponent(absoluteUrl)}&referer=${encodedRef}`;
-    })
-    .join("\n");
-}
-
 // ─── Main AnimePahe Flow ──────────────────────────────────────
 async function streamFromAnimePahe(
   title:   string,
@@ -264,12 +235,11 @@ async function streamFromAnimePahe(
 
   console.log("[AnimePahe] ✓ Got M3U8:", m3u8Data.m3u8.slice(0, 70) + "…");
 
- // ── Step 5: Return proxied URL ──────────────────────────────
-  // Instead of data URI (which HLS.js can't load),
-  // return a /api/proxy URL that serves the rewritten m3u8
+  // ── Step 5: Return proxy URL ────────────────────────────────
+  // Browser fetches /api/proxy → server fetches uwucdn with Referer
+  // → rewrites segment URLs → returns clean m3u8 → HLS.js plays it
   const referer = m3u8Data.referer || "https://kwik.cx/";
 
-  // The proxy will fetch the m3u8, rewrite segment URLs, and return it
   const proxyUrl =
     `/api/proxy` +
     `?url=${encodeURIComponent(m3u8Data.m3u8)}` +
@@ -278,48 +248,7 @@ async function streamFromAnimePahe(
   console.log("[AnimePahe] ✓ Returning proxy URL:", proxyUrl);
 
   return {
-    url:       proxyUrl,          // /api/proxy?url=...&referer=...
-    subtitles: [],
-    intro:     null,
-    outro:     null,
-    source:    `AnimePahe (${source.quality} · ${source.audio === "eng" ? "Dub" : "Sub"})`,
-    referer,
-    headers:   m3u8Data.headers,
-  };
-
-    if (!m3u8Res.ok) throw new Error(`M3U8 fetch failed: ${m3u8Res.status}`);
-    m3u8Content = await m3u8Res.text();
-  } catch (err: any) {
-    console.error("[AnimePahe] M3U8 content fetch failed:", err.message);
-    // Fall back to returning proxy URL — let client fetch it
-    const proxyUrl =
-      `/api/proxy` +
-      `?url=${encodeURIComponent(m3u8Data.m3u8)}` +
-      `&referer=${encodeURIComponent(referer)}`;
-
-    return {
-      url:       proxyUrl,
-      subtitles: [],
-      intro:     null,
-      outro:     null,
-      source:    `AnimePahe (${source.quality} · ${source.audio === "eng" ? "Dub" : "Sub"})`,
-      referer,
-      headers:   m3u8Data.headers,
-    };
-  }
-
-  // Rewrite all segment/sub-playlist URLs inside the m3u8
-  const rewritten = rewriteM3u8(m3u8Content, m3u8Data.m3u8, referer);
-
-  // Encode and return as data URI so HLS.js can load it directly
-  // without needing an extra round-trip to /api/proxy
-  const encoded   = Buffer.from(rewritten).toString("base64");
-  const dataUri   = `data:application/vnd.apple.mpegurl;base64,${encoded}`;
-
-  console.log("[AnimePahe] ✓ M3U8 rewritten, segments proxied");
-
-  return {
-    url:       dataUri,
+    url:       proxyUrl,
     subtitles: [],
     intro:     null,
     outro:     null,
