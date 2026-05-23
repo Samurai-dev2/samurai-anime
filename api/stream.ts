@@ -51,7 +51,7 @@ interface PaheM3u8Result {
 }
 
 const PAHE_API =
-  process.env.ANIMEPAHE_API_URL || "https://your-animepahe-scraper.onrender.com";
+  process.env.ANIMEPAHE_API_URL || "https://animepahe-api-topaz-eta.vercel.app";
 
 const TIMEOUT_MS = 20_000;
 
