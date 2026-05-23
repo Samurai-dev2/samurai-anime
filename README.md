@@ -1,37 +1,48 @@
 <p align="center">
   <kbd>
-    <img src="./public/images/samurai-logo.png" alt="Project Logo" width="200">
+    <img src="./public/images/samurai-logo.png" alt="Samurai Anime Logo" width="180">
   </kbd>
 </p>
 
+<h1 align="center">Samurai Anime 1.0 🎌</h1>
 
-<div align="center">
-<h1> Samurai Anime 1.0 🎌</h1>
-</div>
+<p align="center">
+  <strong>A fast, ad-free anime streaming platform powered by modern APIs.</strong>
+</p>
 
+---
 
-Ok so after 20 million years I am happy to announce this project in <strong>1.0</strong> <br>
-This project uses the jikan api then uses an API called animepahe api which scarpers the raw m3u8 files from Animepahe thus giving it no ads 
-# Known Glitches
-<ul>
-<li> For some reason if you watch an anime thats in season 2 it wont work plan to fix it in 1.0.1</li>
-</ul>
-<h1> Future Plans</h1>
-<ul>
-Comments<br>
-</ul>
-<h1>UPDATES</h1>
-<ul>
-  Added Login/Signup<br>
-  Reactions (Like button/ Dislike button)<br>
-  No ads<br>
-</ul>
+After 20 million years, I am happy to announce that this project is finally in version **1.0**! 🚀
 
-<h1>Special Thanks to...</h1>
-<ul>
-The gng (Derrar, Tawfik, Sulaiman, Tamim, Abdulrahman, Mohammed shemena and Islam)<br>
-Myself (Samurai Dev)<br>
-Jikan Api<br>
-Anime Pahe scraper made by mdtahseen7 (<a href="https://github.com/mdtahseen7/AnimepaheApi">Link</a> for their amazing repo) <br>
-AND yeah thx for reading (BTW DISCORD SERVER COMING SOON!!)
-</ul>
+### 🛠️ How It Works
+This project fetches data using the **Jikan API**, then utilizes an **Animepahe scraper API** to grab the raw `.m3u8` video files directly from Animepahe. The best part? **Zero ads.**
+
+---
+
+### ✨ Features & Recent Updates
+*   **Ad-Free Experience:** Streams content directly without annoying pop-ups.
+*   **User Accounts:** Added fully functional Login and Signup systems.
+*   **Engagement:** Added community reactions (Like and Dislike buttons).
+
+### 🐛 Known Glitches
+*   [ ] **Season 2 Issue:** Watching an anime that is in its second season currently does not work. 
+    *   *Status:* Planning a hotfix for version `1.0.1`.
+
+### 🔮 Future Plans
+*   [ ] Live comment sections under episodes.
+*   [ ] Official Discord Server (Coming Soon!).
+
+---
+
+### 🤝 Special Thanks
+
+Thank you to everyone who supported this project:
+
+*   **The Gang:** Derrar, Tawfik, Sulaiman, Tamim, Abdulrahman, Mohammed Shemena, and Islam.
+*   **The Creator:** Myself (Samurai Dev).
+*   **The Tech:** 
+    *   [Jikan API](https://jikan.moe)
+    *   [mdtahseen7's AnimepaheApi](https://github.com) for their amazing scraper repository.
+
+---
+<p align="center">Thank you for reading and supporting Samurai Anime! ⭐ Drop a star if you like it!</p>
