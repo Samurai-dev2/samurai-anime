@@ -28,6 +28,7 @@ export function useStreamUrl(
   episode: number,
   lang:    "sub" | "dub",
   malId?:  number,
+  season?: number,          // ← add season param
 ): StreamResult {
   const [streamUrl,     setStreamUrl]     = useState<string | null>(null);
   const [subtitles,     setSubtitles]     = useState<SubtitleTrack[]>([]);
@@ -38,7 +39,6 @@ export function useStreamUrl(
 
   useEffect(() => {
     if (!title) return;
-
     let cancelled = false;
 
     async function fetchStream() {
@@ -54,30 +54,22 @@ export function useStreamUrl(
           title:   title!,
           episode: String(episode),
           lang,
+          season:  String(season ?? 1),   // ← pass season
           ...(malId ? { malId: String(malId) } : {}),
         });
 
-        const res = await fetch(`/api/stream?${params}`);
-
-        if (!res.ok) {
-          const body = await res.json().catch(() => ({}));
-          throw new Error(body?.error || `API error ${res.status}`);
-        }
-
+        const res  = await fetch(`/api/stream?${params}`);
         const data = await res.json();
 
         if (!cancelled) {
-          setStreamUrl(   data.url      ?? null);
-          setSubtitles(   data.subtitles ?? []);
-          setSourceLabel( data.source   ?? null);
+          setStreamUrl(  data.url       ?? null);
+          setSubtitles(  data.subtitles ?? []);
+          setSourceLabel(data.source    ?? null);
           setStreamHeaders({
             referer: data.referer,
             headers: data.headers,
           });
-
-          if (!data.url) {
-            setError(data.error ?? "No stream URL returned");
-          }
+          if (!data.url) setError(data.error ?? "No stream returned");
         }
       } catch (err: any) {
         if (!cancelled) setError(err.message ?? "Unknown error");
@@ -88,7 +80,7 @@ export function useStreamUrl(
 
     fetchStream();
     return () => { cancelled = true; };
-  }, [title, episode, lang, malId]);
+  }, [title, episode, lang, malId, season]);  // ← add season to deps
 
   return {
     streamUrl,
