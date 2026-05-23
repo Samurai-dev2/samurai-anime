@@ -1,27 +1,13 @@
 {
   "functions": {
-    "api/stream.ts": {
+    "api/*.ts": {
       "maxDuration": 30
-    },
-    "api/proxy.ts": {
-      "maxDuration": 30
-    },
-    "api/reactions.ts": {
-      "maxDuration": 10
     }
   },
   "rewrites": [
     {
-      "source": "/api/stream",
-      "destination": "/api/stream"
-    },
-    {
-      "source": "/api/proxy",
-      "destination": "/api/proxy"
-    },
-    {
-      "source": "/api/reactions",
-      "destination": "/api/reactions"
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
     },
     {
       "source": "/(.*)",
