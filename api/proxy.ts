@@ -3,7 +3,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const ALLOWED_HOSTS = [
   "uwucdn.top",
-  "owocdn.top",       // ← add this, seen in your console
+  "owocdn.top",
   "kwik.cx",
   "animepahe.com",
   "animepahe.ru",
@@ -21,12 +21,46 @@ function isAllowedUrl(url: string): boolean {
   }
 }
 
-function rewriteM3u8(
+// Fetch the AES key server-side and return as base64 data URI
+// so HLS.js never needs to make a cross-origin request for it
+async function fetchKeyAsDataUri(
+  keyUrl:  string,
+  referer: string,
+): Promise<string | null> {
+  try {
+    const res = await fetch(keyUrl, {
+      headers: {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin":          "https://kwik.cx",
+        "Referer":         referer,
+        "Sec-Fetch-Dest":  "empty",
+        "Sec-Fetch-Mode":  "cors",
+        "Sec-Fetch-Site":  "cross-site",
+      },
+    });
+
+    if (!res.ok) {
+      console.error("[proxy] Key fetch failed:", res.status, keyUrl);
+      return null;
+    }
+
+    const buffer = await res.arrayBuffer();
+    const base64 = Buffer.from(buffer).toString("base64");
+    return `data:application/octet-stream;base64,${base64}`;
+  } catch (err: any) {
+    console.error("[proxy] Key fetch error:", err.message);
+    return null;
+  }
+}
+
+async function rewriteM3u8(
   content: string,
   baseUrl: string,
   referer: string,
   origin:  string,
-): string {
+): Promise<string> {
   const base       = new URL(baseUrl);
   const encodedRef = encodeURIComponent(referer);
 
@@ -41,35 +75,83 @@ function rewriteM3u8(
     return `${origin}/api/proxy?url=${encodeURIComponent(absolute)}&referer=${encodedRef}`;
   }
 
-  return content
-    .split("\n")
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return line;
+  // Collect all #EXT-X-KEY lines and pre-fetch their keys
+  // so we can inline them as data URIs
+  const lines  = content.split("\n");
+  const result: string[] = [];
 
-      // Rewrite encryption key URI
-      if (trimmed.startsWith("#EXT-X-KEY")) {
-        return line.replace(
-          /URI="([^"]+)"/,
-          (_, keyUrl) => `URI="${toProxyUrl(keyUrl)}"`,
-        );
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      result.push(line);
+      continue;
+    }
+
+    // ── #EXT-X-KEY — inline the key as data URI ──────────
+    if (trimmed.startsWith("#EXT-X-KEY")) {
+      const uriMatch = line.match(/URI="([^"]+)"/);
+
+      if (uriMatch) {
+        const rawKeyUrl = uriMatch[1];
+
+        // Resolve to absolute URL
+        let absoluteKeyUrl: string;
+        try {
+          absoluteKeyUrl = new URL(rawKeyUrl, base).toString();
+        } catch {
+          absoluteKeyUrl = rawKeyUrl;
+        }
+
+        console.log("[proxy] Fetching key server-side:", absoluteKeyUrl.slice(0, 60));
+
+        // Fetch key on the server — no CORS issue here
+        const dataUri = await fetchKeyAsDataUri(absoluteKeyUrl, referer);
+
+        if (dataUri) {
+          // Replace URI with inline data URI — HLS.js supports this
+          const rewritten = line.replace(
+            /URI="([^"]+)"/,
+            `URI="${dataUri}"`
+          );
+          result.push(rewritten);
+          console.log("[proxy] ✓ Key inlined as data URI");
+        } else {
+          // Fall back to proxy URL if key fetch fails
+          const rewritten = line.replace(
+            /URI="([^"]+)"/,
+            (_, keyUrl) => `URI="${toProxyUrl(keyUrl)}"`
+          );
+          result.push(rewritten);
+          console.warn("[proxy] Key fetch failed, using proxy URL as fallback");
+        }
+      } else {
+        result.push(line);
       }
+      continue;
+    }
 
-      // Rewrite map URI (init segments)
-      if (trimmed.startsWith("#EXT-X-MAP")) {
-        return line.replace(
-          /URI="([^"]+)"/,
-          (_, mapUrl) => `URI="${toProxyUrl(mapUrl)}"`,
-        );
-      }
+    // ── #EXT-X-MAP — proxy the init segment ──────────────
+    if (trimmed.startsWith("#EXT-X-MAP")) {
+      const rewritten = line.replace(
+        /URI="([^"]+)"/,
+        (_, mapUrl) => `URI="${toProxyUrl(mapUrl)}"`
+      );
+      result.push(rewritten);
+      continue;
+    }
 
-      // Skip other # tags
-      if (trimmed.startsWith("#")) return line;
+    // ── Other # tags — pass through ──────────────────────
+    if (trimmed.startsWith("#")) {
+      result.push(line);
+      continue;
+    }
 
-      // Rewrite segment URLs
-      return toProxyUrl(trimmed);
-    })
-    .join("\n");
+    // ── Segment URLs — proxy them ─────────────────────────
+    result.push(toProxyUrl(trimmed));
+  }
+
+  return result.join("\n");
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -97,31 +179,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const ref = typeof referer === "string" ? referer : "https://kwik.cx/";
 
-  // Extract kwik episode ID from referer for proper headers
-  const kwikEpId = ref.includes("kwik.cx/e/")
-    ? ref.split("kwik.cx/e/")[1]?.split(/[?#]/)[0] ?? ""
-    : "";
+  const upstreamHeaders = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin":          "https://kwik.cx",
+    "Referer":         ref,
+    "Sec-Fetch-Dest":  "empty",
+    "Sec-Fetch-Mode":  "cors",
+    "Sec-Fetch-Site":  "cross-site",
+    "Connection":      "keep-alive",
+    ...(req.headers.range ? { "Range": req.headers.range as string } : {}),
+  };
 
   try {
-    const upstream = await fetch(url, {
-      headers: {
-        // Full browser-like headers to avoid 403
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept":          "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Origin":          "https://kwik.cx",
-        "Referer":         ref,
-        "Sec-Fetch-Dest":  "empty",
-        "Sec-Fetch-Mode":  "cors",
-        "Sec-Fetch-Site":  "cross-site",
-        "Connection":      "keep-alive",
-        ...(req.headers.range ? { "Range": req.headers.range as string } : {}),
-      },
-    });
+    const upstream = await fetch(url, { headers: upstreamHeaders });
 
     if (!upstream.ok) {
-      console.error("[proxy] Upstream", upstream.status, "for:", url.slice(0, 80));
+      console.error("[proxy] Upstream", upstream.status, url.slice(0, 80));
       return res.status(upstream.status).json({ error: `Upstream ${upstream.status}` });
     }
 
@@ -132,23 +207,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       contentType.includes("mpegurl") ||
       contentType.includes("x-mpegURL");
 
-    // M3U8 — rewrite and return
+    // ── M3U8 — rewrite with inlined keys ─────────────────
     if (isM3u8) {
       const text      = await upstream.text();
-      const rewritten = rewriteM3u8(text, url, ref, origin);
-      console.log("[proxy] ✓ m3u8 rewritten:", url.slice(0, 60));
+      // rewriteM3u8 is now async because it fetches keys
+      const rewritten = await rewriteM3u8(text, url, ref, origin);
+      console.log("[proxy] ✓ m3u8 served:", url.slice(0, 60));
       res.setHeader("Content-Type",  "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache");
       return res.status(200).send(rewritten);
     }
 
-    // Binary (segments, key files, etc.)
+    // ── Binary (segments, etc.) ───────────────────────────
     const buffer = await upstream.arrayBuffer();
-    const isKey  = url.includes(".key") || url.endsWith("mon.key");
 
     res.writeHead(upstream.status === 206 ? 206 : 200, {
-      "Content-Type":  isKey ? "application/octet-stream" : contentType,
-      "Cache-Control": isKey ? "no-cache" : "public, max-age=3600",
+      "Content-Type":  contentType,
+      "Cache-Control": "public, max-age=3600",
       ...(upstream.headers.get("content-length")
         ? { "Content-Length": upstream.headers.get("content-length")! }
         : {}),
