@@ -1,7 +1,6 @@
 // api/stream.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-// ─── Types ────────────────────────────────────────────────────
 interface SubtitleTrack {
   url:   string;
   lang:  string;
@@ -51,13 +50,11 @@ interface PaheM3u8Result {
   proxy_url: string;
 }
 
-// ─── Config ───────────────────────────────────────────────────
 const PAHE_API =
   process.env.ANIMEPAHE_API_URL || "https://your-animepahe-scraper.onrender.com";
 
 const TIMEOUT_MS = 20_000;
 
-// ─── Helpers ──────────────────────────────────────────────────
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return Promise.race([
     promise,
@@ -85,26 +82,101 @@ async function fetchJson<T>(url: string): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// Extract season number from title if present
+// "Attack on Titan Season 2" → 2
+// "Sword Art Online II" → 2
+// "Re:Zero Season 2 Part 2" → 2
+function extractSeasonFromTitle(title: string): number | null {
+  const patterns = [
+    /\bseason\s+(\d+)/i,
+    /\bs(\d+)\b/i,
+    /\b(\d+)(?:st|nd|rd|th)\s+season/i,
+    // Roman numerals II, III, IV (common in anime)
+    /\b(II|III|IV|V)\b/,
+  ];
+
+  const romanMap: Record<string, number> = {
+    II: 2, III: 3, IV: 4, V: 5,
+  };
+
+  for (const pattern of patterns) {
+    const match = title.match(pattern);
+    if (match) {
+      const val = match[1];
+      return romanMap[val] ?? parseInt(val);
+    }
+  }
+  return null;
+}
+
+// Clean title for search — remove season/part suffixes
 function cleanTitle(title: string): string {
   return title
-    .replace(/\s+season\s+\d+/gi, "")
-    .replace(/\s+part\s+\d+/gi,   "")
-    .replace(/\s+cour\s+\d+/gi,   "")
-    .replace(/\s+\(\d{4}\)/g,     "")
-    .replace(/\s+[Ss]\d+$/g,      "")
+    .replace(/\s+season\s+\d+/gi,    "")
+    .replace(/\s+part\s+\d+/gi,      "")
+    .replace(/\s+cour\s+\d+/gi,      "")
+    .replace(/\s+\(\d{4}\)/g,        "")
+    .replace(/\s+[Ss]\d+$/g,         "")
+    .replace(/\s+(II|III|IV|V)$/,    "")  // remove Roman numerals
+    .replace(/\s+\d+(?:st|nd|rd|th)\s+season/gi, "")
     .trim();
 }
 
-function scoreTitleMatch(result: PaheSearchResult, target: string): number {
+// Score title match — higher = better
+function scoreTitleMatch(
+  result:       PaheSearchResult,
+  cleanedQuery: string,
+  seasonNum:    number | null,
+): number {
   const a = result.title.toLowerCase();
-  const b = target.toLowerCase();
-  if (a === b)                             return 100;
-  if (a.startsWith(b) || b.startsWith(a)) return 80;
-  if (a.includes(b)   || b.includes(a))   return 60;
-  const wordsA  = new Set(a.split(/\s+/));
-  const wordsB  = b.split(/\s+/);
-  const overlap = wordsB.filter((w) => wordsA.has(w)).length;
-  return (overlap / wordsB.length) * 40;
+  const b = cleanedQuery.toLowerCase();
+
+  let score = 0;
+
+  // Base title similarity
+  if (a === b)                             score += 100;
+  else if (a.startsWith(b) || b.startsWith(a)) score += 80;
+  else if (a.includes(b) || b.includes(a))     score += 60;
+  else {
+    const wordsA  = new Set(a.split(/\s+/));
+    const wordsB  = b.split(/\s+/);
+    const overlap = wordsB.filter((w) => wordsA.has(w)).length;
+    score += (overlap / wordsB.length) * 40;
+  }
+
+  // Season matching bonus/penalty
+  if (seasonNum && seasonNum > 1) {
+    const resultSeason = extractSeasonFromTitle(result.title);
+
+    if (resultSeason === seasonNum) {
+      score += 50; // Strong bonus for matching season
+    } else if (resultSeason === null && seasonNum > 1) {
+      score -= 20; // Penalty if no season in result but we want S2+
+    } else if (resultSeason !== null && resultSeason !== seasonNum) {
+      score -= 40; // Strong penalty for wrong season
+    }
+
+    // Check for season keywords in result title
+    const seasonKeywords = [
+      `season ${seasonNum}`,
+      `s${seasonNum}`,
+      // Roman numerals for seasons 2-5
+      ["", "", "ii", "iii", "iv", "v"][seasonNum] ?? "",
+    ].filter(Boolean);
+
+    const resultLower = result.title.toLowerCase();
+    if (seasonKeywords.some((kw) => resultLower.includes(kw))) {
+      score += 30;
+    }
+  } else {
+    // For season 1 — penalise results that have a season number > 1
+    const resultSeason = extractSeasonFromTitle(result.title);
+    if (resultSeason && resultSeason > 1) {
+      score -= 30;
+    }
+  }
+
+  return score;
 }
 
 function pickSource(sources: PaheSource[], lang: "sub" | "dub"): PaheSource | null {
@@ -120,15 +192,19 @@ function pickSource(sources: PaheSource[], lang: "sub" | "dub"): PaheSource | nu
   return pool[0];
 }
 
-// ─── Main AnimePahe Flow ──────────────────────────────────────
+// ─── Main flow ────────────────────────────────────────────────
 async function streamFromAnimePahe(
-  title:   string,
-  episode: number,
-  lang:    "sub" | "dub",
+  title:     string,
+  episode:   number,
+  lang:      "sub" | "dub",
+  seasonNum: number,
 ): Promise<StreamResponse | null> {
 
   // ── Step 1: Search ─────────────────────────────────────────
   const searchTitle = cleanTitle(title);
+  console.log(
+    `[AnimePahe] Searching: "${searchTitle}" (original: "${title}", season: ${seasonNum})`
+  );
 
   let results: PaheSearchResult[];
   try {
@@ -145,17 +221,28 @@ async function streamFromAnimePahe(
     return null;
   }
 
+  console.log("[AnimePahe] Got", results.length, "results");
+
+  // Score all results
   const scored = results
-    .map((r) => ({ result: r, score: scoreTitleMatch(r, searchTitle) }))
+    .map((r) => ({
+      result: r,
+      score:  scoreTitleMatch(r, searchTitle, seasonNum),
+    }))
     .sort((a, b) => b.score - a.score);
 
   console.log(
-    "[AnimePahe] Top matches:",
-    scored.slice(0, 3).map((s) => `"${s.result.title}" (${s.score})`).join(", "),
+    "[AnimePahe] Scored results:",
+    scored
+      .slice(0, 5)
+      .map((s) => `"${s.result.title}" → ${s.score}`)
+      .join(" | "),
   );
 
+  // Always pick the top-scored result
+  // (even if score is low — first result is best guess)
   const best = scored[0].result;
-  console.log("[AnimePahe] Using:", best.title, "| session:", best.session);
+  console.log("[AnimePahe] Selected:", best.title, "| session:", best.session);
 
   // ── Step 2: Get Episodes ────────────────────────────────────
   let episodes: PaheEpisode[];
@@ -175,11 +262,40 @@ async function streamFromAnimePahe(
 
   console.log("[AnimePahe] Got", episodes.length, "episodes");
 
-  const ep = episodes.find((e) => e.number === episode);
+  // Find episode — if not found in best result, try next scored results
+  let ep = episodes.find((e) => e.number === episode);
+
   if (!ep) {
     console.log(
-      "[AnimePahe] Episode", episode, "not found. Available:",
-      episodes.map((e) => e.number).slice(0, 10).join(", "), "...",
+      `[AnimePahe] Episode ${episode} not found in "${best.title}". Trying other results...`
+    );
+
+    // Try each other result in score order
+    for (const { result: alt } of scored.slice(1)) {
+      console.log("[AnimePahe] Trying alt:", alt.title);
+      try {
+        const altEps = await fetchJson<PaheEpisode[]>(
+          `${PAHE_API}/episodes?session=${alt.session}`
+        );
+        const altEp = altEps?.find((e) => e.number === episode);
+        if (altEp) {
+          console.log("[AnimePahe] Found ep", episode, "in alt:", alt.title);
+          episodes = altEps;
+          ep = altEp;
+          // Update best to this alt
+          Object.assign(best, alt);
+          break;
+        }
+      } catch {
+        // continue to next
+      }
+    }
+  }
+
+  if (!ep) {
+    console.log(
+      "[AnimePahe] Episode", episode, "not found in any result.",
+      "Available in best:", episodes.map((e) => e.number).slice(0, 10).join(", "),
     );
     return null;
   }
@@ -215,44 +331,38 @@ async function streamFromAnimePahe(
     return null;
   }
 
-  console.log("[AnimePahe] Picked:", source.quality, source.audio, source.url);
+  console.log("[AnimePahe] Picked:", source.quality, source.audio);
 
-  // ── Step 4: Resolve M3U8 from Kwik ─────────────────────────
+  // ── Step 4: Resolve M3U8 ───────────────────────────────────
   let m3u8Data: PaheM3u8Result;
   try {
     m3u8Data = await fetchJson<PaheM3u8Result>(
       `${PAHE_API}/m3u8?url=${encodeURIComponent(source.url)}`
     );
   } catch (err: any) {
-    console.error("[AnimePahe] M3U8 resolve failed:", err.message);
+    console.error("[AnimePahe] M3U8 failed:", err.message);
     return null;
   }
 
   if (!m3u8Data?.m3u8) {
-    console.log("[AnimePahe] No M3U8 in response");
+    console.log("[AnimePahe] No M3U8");
     return null;
   }
 
-  console.log("[AnimePahe] ✓ Got M3U8:", m3u8Data.m3u8.slice(0, 70) + "…");
+  console.log("[AnimePahe] ✓ M3U8:", m3u8Data.m3u8.slice(0, 70) + "…");
 
-  // ── Step 5: Return proxy URL ────────────────────────────────
-  // Browser fetches /api/proxy → server fetches uwucdn with Referer
-  // → rewrites segment URLs → returns clean m3u8 → HLS.js plays it
-  const referer = m3u8Data.referer || "https://kwik.cx/";
-
+  const referer  = m3u8Data.referer || "https://kwik.cx/";
   const proxyUrl =
     `/api/proxy` +
     `?url=${encodeURIComponent(m3u8Data.m3u8)}` +
     `&referer=${encodeURIComponent(referer)}`;
-
-  console.log("[AnimePahe] ✓ Returning proxy URL:", proxyUrl);
 
   return {
     url:       proxyUrl,
     subtitles: [],
     intro:     null,
     outro:     null,
-    source:    `AnimePahe (${source.quality} · ${source.audio === "eng" ? "Dub" : "Sub"})`,
+    source:    `AnimePahe · ${source.quality} · ${source.audio === "eng" ? "Dub" : "Sub"}`,
     referer,
     headers:   m3u8Data.headers,
   };
@@ -270,17 +380,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "GET")
     return res.status(405).json({ error: "Method not allowed" });
 
-  const { title, episode, lang } = req.query;
+  const { title, episode, lang, season } = req.query;
 
   if (!title || typeof title !== "string")
     return res.status(400).json({ error: "title is required" });
 
-  const ep    = parseInt(String(episode || "1")) || 1;
-  const audio = (lang === "dub" ? "dub" : "sub") as "sub" | "dub";
+  const ep        = parseInt(String(episode || "1")) || 1;
+  const audio     = (lang === "dub" ? "dub" : "sub") as "sub" | "dub";
+  const seasonNum = parseInt(String(season || "1")) || 1;
 
-  console.log(`\n[stream] title="${title}" ep=${ep} lang=${audio}`);
+  console.log(`\n[stream] "${title}" S${seasonNum}E${ep} lang=${audio}`);
 
-  const result = await streamFromAnimePahe(title, ep, audio);
+  const result = await streamFromAnimePahe(title, ep, audio, seasonNum);
 
   if (result?.url) {
     console.log("[stream] ✓ Success:", result.source);
@@ -294,6 +405,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     intro:     null,
     outro:     null,
     source:    null,
-    error:     "No stream found on AnimePahe for this title/episode",
+    error:     "No stream found on AnimePahe",
   });
 }
