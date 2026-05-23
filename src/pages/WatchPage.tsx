@@ -187,15 +187,20 @@ export default function WatchPage() {
   const [reloadKey,     setReloadKey]  = useState(0);
 
   // ── Stream ─────────────────────────────────────────────────
-  const {
-    streamUrl,
-    subtitles,
-    streamHeaders,
-    loading:     streamLoading,
-    error:       streamError,
-    sourceLabel,
-  } = useStreamUrl(title, episode, lang, id);
-
+const {
+  streamUrl,
+  subtitles,
+  streamHeaders,
+  loading:     streamLoading,
+  error:       streamError,
+  sourceLabel,
+} = useStreamUrl(
+  title,
+  episode,
+  lang,
+  id,
+  season,   // ← add this
+);
   // ── Sync URL + save progress ───────────────────────────────
   useEffect(() => {
     if (!id) return;
