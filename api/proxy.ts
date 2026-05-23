@@ -3,6 +3,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const ALLOWED_HOSTS = [
   "uwucdn.top",
+  "owocdn.top",       // ← add this, seen in your console
   "kwik.cx",
   "animepahe.com",
   "animepahe.ru",
@@ -30,7 +31,6 @@ function rewriteM3u8(
   const encodedRef = encodeURIComponent(referer);
 
   function toProxyUrl(rawUrl: string): string {
-    // Resolve relative → absolute
     let absolute: string;
     try {
       absolute = new URL(rawUrl, base).toString();
@@ -47,8 +47,7 @@ function rewriteM3u8(
       const trimmed = line.trim();
       if (!trimmed) return line;
 
-      // ── Rewrite #EXT-X-KEY URI ──────────────────────────
-      // e.g. #EXT-X-KEY:METHOD=AES-128,URI="https://vault.../mon.key",IV=0x...
+      // Rewrite encryption key URI
       if (trimmed.startsWith("#EXT-X-KEY")) {
         return line.replace(
           /URI="([^"]+)"/,
@@ -56,8 +55,7 @@ function rewriteM3u8(
         );
       }
 
-      // ── Rewrite #EXT-X-MAP URI ───────────────────────────
-      // e.g. #EXT-X-MAP:URI="init.mp4"
+      // Rewrite map URI (init segments)
       if (trimmed.startsWith("#EXT-X-MAP")) {
         return line.replace(
           /URI="([^"]+)"/,
@@ -65,10 +63,10 @@ function rewriteM3u8(
         );
       }
 
-      // ── Skip all other # lines ───────────────────────────
+      // Skip other # tags
       if (trimmed.startsWith("#")) return line;
 
-      // ── Rewrite segment / sub-playlist URLs ──────────────
+      // Rewrite segment URLs
       return toProxyUrl(trimmed);
     })
     .join("\n");
@@ -84,9 +82,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const { url, referer } = req.query;
 
-  if (!url || typeof url !== "string") {
+  if (!url || typeof url !== "string")
     return res.status(400).json({ error: "url param required" });
-  }
 
   if (!isAllowedUrl(url)) {
     console.warn("[proxy] Blocked:", url);
@@ -100,71 +97,66 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   const ref = typeof referer === "string" ? referer : "https://kwik.cx/";
 
+  // Extract kwik episode ID from referer for proper headers
+  const kwikEpId = ref.includes("kwik.cx/e/")
+    ? ref.split("kwik.cx/e/")[1]?.split(/[?#]/)[0] ?? ""
+    : "";
+
   try {
     const upstream = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept":     "*/*",
-        "Origin":     "https://kwik.cx",
-        "Referer":    ref,
+        // Full browser-like headers to avoid 403
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept":          "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Origin":          "https://kwik.cx",
+        "Referer":         ref,
+        "Sec-Fetch-Dest":  "empty",
+        "Sec-Fetch-Mode":  "cors",
+        "Sec-Fetch-Site":  "cross-site",
+        "Connection":      "keep-alive",
         ...(req.headers.range ? { "Range": req.headers.range as string } : {}),
       },
     });
 
     if (!upstream.ok) {
-      console.error("[proxy] Upstream error:", upstream.status, url);
+      console.error("[proxy] Upstream", upstream.status, "for:", url.slice(0, 80));
       return res.status(upstream.status).json({ error: `Upstream ${upstream.status}` });
     }
 
     const contentType = upstream.headers.get("content-type") || "application/octet-stream";
 
     const isM3u8 =
-      url.includes(".m3u8")              ||
-      contentType.includes("mpegurl")    ||
+      url.includes(".m3u8")           ||
+      contentType.includes("mpegurl") ||
       contentType.includes("x-mpegURL");
 
-    // ── M3U8 playlist — rewrite all URLs ─────────────────
+    // M3U8 — rewrite and return
     if (isM3u8) {
       const text      = await upstream.text();
       const rewritten = rewriteM3u8(text, url, ref, origin);
-
-      console.log("[proxy] Serving rewritten m3u8 for:", url.slice(0, 60));
-
+      console.log("[proxy] ✓ m3u8 rewritten:", url.slice(0, 60));
       res.setHeader("Content-Type",  "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache");
       return res.status(200).send(rewritten);
     }
 
-    // ── .key files — serve as binary ─────────────────────
-    // AES-128 key files are small binary blobs
-    const isKey = url.includes(".key") || url.endsWith("mon.key");
-
-    if (isKey) {
-      const buffer = await upstream.arrayBuffer();
-      console.log("[proxy] Serving key file:", url.slice(0, 60));
-      res.setHeader("Content-Type",  "application/octet-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.writeHead(200, {
-        "Content-Type":  "application/octet-stream",
-        "Cache-Control": "no-cache",
-      });
-      return res.end(Buffer.from(buffer));
-    }
-
-    // ── Binary segments (.ts, .jpg chunks, etc.) ─────────
+    // Binary (segments, key files, etc.)
     const buffer = await upstream.arrayBuffer();
+    const isKey  = url.includes(".key") || url.endsWith("mon.key");
 
-    const forwardHeaders: Record<string, string> = {
-      "Content-Type":  contentType,
-      "Cache-Control": "public, max-age=3600",
-    };
+    res.writeHead(upstream.status === 206 ? 206 : 200, {
+      "Content-Type":  isKey ? "application/octet-stream" : contentType,
+      "Cache-Control": isKey ? "no-cache" : "public, max-age=3600",
+      ...(upstream.headers.get("content-length")
+        ? { "Content-Length": upstream.headers.get("content-length")! }
+        : {}),
+      ...(upstream.headers.get("content-range")
+        ? { "Content-Range": upstream.headers.get("content-range")! }
+        : {}),
+    });
 
-    const contentLength = upstream.headers.get("content-length");
-    const contentRange  = upstream.headers.get("content-range");
-    if (contentLength) forwardHeaders["Content-Length"] = contentLength;
-    if (contentRange)  forwardHeaders["Content-Range"]  = contentRange;
-
-    res.writeHead(upstream.status === 206 ? 206 : 200, forwardHeaders);
     res.end(Buffer.from(buffer));
 
   } catch (err: any) {
