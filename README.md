@@ -1,6 +1,7 @@
 <p align="center">
-  <img src="./public/images/samurai-logo.png" alt="Project Logo" width="200">
+  <img src="./public/images/samurai-logo.png" alt="Project Logo" width="200" style="border-radius: 50%; border: 4px solid red;">
 </p>
+
 <div align="center">
 <h1> Samurai Anime 1.0 🎌</h1>
 </div>
