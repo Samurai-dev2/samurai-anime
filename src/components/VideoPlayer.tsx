@@ -16,8 +16,6 @@ interface VideoPlayerProps {
   referer?: string;
 }
 
-// ─── Script / CSS loader helpers ──────────────────────────────
-
 function loadStylesheet(id: string, href: string): void {
   if (document.getElementById(id)) return;
   const link = document.createElement("link");
@@ -29,26 +27,21 @@ function loadStylesheet(id: string, href: string): void {
 
 function loadScript(id: string, src: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (document.getElementById(id)) {
-      resolve();
-      return;
-    }
-    const script = document.createElement("script");
-    script.id = id;
-    script.src = src;
-    script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
-    document.head.appendChild(script);
+    if (document.getElementById(id)) { resolve(); return; }
+    const s = document.createElement("script");
+    s.id = id;
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`Failed to load: ${src}`));
+    document.head.appendChild(s);
   });
 }
 
-let libsPromise: Promise<{ Plyr: any; Hls: any }> | null = null;
-
+let libsCache: Promise<{ Plyr: any; Hls: any }> | null = null;
 function loadLibs(): Promise<{ Plyr: any; Hls: any }> {
-  if (libsPromise) return libsPromise;
-
-  libsPromise = (async () => {
+  if (libsCache) return libsCache;
+  libsCache = (async () => {
     loadStylesheet(
       "plyr-css",
       "https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css"
@@ -61,16 +54,10 @@ function loadLibs(): Promise<{ Plyr: any; Hls: any }> {
       "plyr-script",
       "https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.min.js"
     );
-    return {
-      Plyr: (window as any).Plyr,
-      Hls: (window as any).Hls,
-    };
+    return { Plyr: (window as any).Plyr, Hls: (window as any).Hls };
   })();
-
-  return libsPromise;
+  return libsCache;
 }
-
-// ─── Component ────────────────────────────────────────────────
 
 export default function VideoPlayer({
   streamUrl,
@@ -79,12 +66,11 @@ export default function VideoPlayer({
   title,
   referer,
 }: VideoPlayerProps) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const plyrRef = useRef<any>(null);
-  const hlsRef = useRef<any>(null);
-
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const videoRef     = useRef<HTMLVideoElement>(null);
+  const plyrRef      = useRef<any>(null);
+  const hlsRef       = useRef<any>(null);
+  const [error,      setError]      = useState<string | null>(null);
+  const [loading,    setLoading]    = useState(true);
   const [retryCount, setRetryCount] = useState(0);
 
   const destroyPlayer = useCallback(() => {
@@ -101,8 +87,27 @@ export default function VideoPlayer({
   useEffect(() => {
     if (!streamUrl) return;
 
-    let cancelled = false;
+    // ── Validate the URL we received ───────────────────────
+    console.log("[VideoPlayer] streamUrl received:", streamUrl);
 
+    if (streamUrl.startsWith("blob:")) {
+      console.error("[VideoPlayer] ❌ Got a blob URL - this will fail!");
+      setError("Internal error: received a blob URL instead of a proxy URL.");
+      setLoading(false);
+      return;
+    }
+
+    if (streamUrl.startsWith("/")) {
+      console.error(
+        "[VideoPlayer] ⚠ Got a relative URL:",
+        streamUrl,
+        "\nThis may fail if HLS.js resolves it against a blob: base URL.",
+        "\nThe proxy should return absolute URLs like https://..."
+      );
+      // We can fix this client-side as a safety net
+    }
+
+    let cancelled = false;
     setError(null);
     setLoading(true);
     destroyPlayer();
@@ -114,136 +119,124 @@ export default function VideoPlayer({
 
         const video = videoRef.current;
 
-        // ── HLS setup ──────────────────────────────────────
+        // Make the URL absolute if it is relative
+        // This is a client-side safety net — the proxy should already
+        // return absolute URLs, but just in case
+        const absoluteUrl = streamUrl.startsWith("/")
+          ? `${window.location.origin}${streamUrl}`
+          : streamUrl;
+
+        console.log("[VideoPlayer] Loading HLS source:", absoluteUrl);
+
         if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker: true,
             maxBufferLength: 30,
             maxBufferSize: 60 * 1000 * 1000,
-            // Longer timeout for slow CDN segments
-            manifestLoadingTimeOut: 15_000,
-            levelLoadingTimeOut: 15_000,
-            fragLoadingTimeOut: 30_000,
+            manifestLoadingTimeOut: 20_000,
+            levelLoadingTimeOut:    20_000,
+            fragLoadingTimeOut:     30_000,
+            manifestLoadingMaxRetry: 1,
+            levelLoadingMaxRetry:    1,
+            fragLoadingMaxRetry:     2,
           });
 
           hlsRef.current = hls;
 
-          hls.on(Hls.Events.ERROR, (_: any, data: any) => {
-            if (cancelled) return;
-
-            console.warn(
-              "[HLS] Error:",
-              data.type,
-              data.details,
-              "fatal:", data.fatal
-            );
-
-            if (!data.fatal) return; // non-fatal — HLS.js will retry
-
-            // Fatal errors need explicit recovery or we show an error
-            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-              console.error("[HLS] Fatal network error — attempting recovery");
-              hls.startLoad();
-            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-              console.error("[HLS] Fatal media error — attempting recoverMediaError");
-              hls.recoverMediaError();
-            } else {
-              setError(
-                "Stream failed to load. " +
-                  "The source may be unavailable or geo-restricted."
-              );
-              setLoading(false);
-            }
-          });
-
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (cancelled) return;
-            console.log("[HLS] ✓ Manifest parsed");
+            console.log("[VideoPlayer] ✓ Manifest parsed");
             setLoading(false);
           });
 
-          hls.loadSource(streamUrl);
-          hls.attachMedia(video);
-        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-          // Safari — native HLS
-          video.src = streamUrl;
-          video.addEventListener("loadedmetadata", () => {
-            if (!cancelled) setLoading(false);
-          }, { once: true });
-          video.addEventListener("error", () => {
-            if (!cancelled) {
-              setError("Failed to load stream (native HLS error).");
+          hls.on(Hls.Events.ERROR, (_: any, data: any) => {
+            if (cancelled) return;
+            console.log(
+              "[VideoPlayer] HLS error:",
+              data.type, "|",
+              data.details, "|",
+              "fatal:", data.fatal, "|",
+              "url:", (data.url || "").slice(0, 100)
+            );
+
+            if (!data.fatal) return;
+
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              console.error("[VideoPlayer] Fatal network error — startLoad()");
+              hls.startLoad();
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              console.error("[VideoPlayer] Fatal media error — recoverMediaError()");
+              hls.recoverMediaError();
+            } else {
+              setError("Stream failed to load. Please try again.");
               setLoading(false);
             }
-          }, { once: true });
+          });
+
+          hls.loadSource(absoluteUrl);
+          hls.attachMedia(video);
+
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          video.src = absoluteUrl;
+          video.addEventListener(
+            "loadedmetadata",
+            () => { if (!cancelled) setLoading(false); },
+            { once: true }
+          );
+          video.addEventListener(
+            "error",
+            () => {
+              if (!cancelled) {
+                setError("Failed to load stream.");
+                setLoading(false);
+              }
+            },
+            { once: true }
+          );
         } else {
-          setError("HLS playback is not supported in this browser.");
+          setError("Your browser does not support HLS playback.");
           setLoading(false);
           return;
         }
 
-        // ── Plyr setup ─────────────────────────────────────
         const player = new Plyr(video, {
           title: title || "Anime",
           controls: [
-            "play-large",
-            "play",
-            "rewind",
-            "fast-forward",
-            "progress",
-            "current-time",
-            "duration",
-            "mute",
-            "volume",
-            "captions",
-            "settings",
-            "pip",
-            "fullscreen",
+            "play-large", "play", "rewind", "fast-forward",
+            "progress", "current-time", "duration",
+            "mute", "volume", "captions", "settings", "pip", "fullscreen",
           ],
           settings: ["captions", "quality", "speed"],
-          speed: {
-            selected: 1,
-            options: [0.5, 0.75, 1, 1.25, 1.5, 2],
-          },
-          captions: {
-            active: subtitles.length > 0,
-            language: "en",
-            update: true,
-          },
+          speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+          captions: { active: subtitles.length > 0, language: "en", update: true },
           poster: poster ?? undefined,
           autoplay: false,
         });
 
         plyrRef.current = player;
 
-        // ── Quality levels ─────────────────────────────────
         if (hlsRef.current) {
           const hls = hlsRef.current;
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (cancelled) return;
-
             const levels: number[] = hls.levels.map((l: any) => l.height);
-            const options = [0, ...levels]; // 0 = Auto
-
             player.config.quality = {
               default: 0,
-              options,
+              options: [0, ...levels],
               forced: true,
-              onChange(newQuality: number) {
-                if (newQuality === 0) {
-                  hls.currentLevel = -1; // Auto
+              onChange(q: number) {
+                if (q === 0) {
+                  hls.currentLevel = -1;
                 } else {
-                  const idx = hls.levels.findIndex(
-                    (l: any) => l.height === newQuality
-                  );
+                  const idx = hls.levels.findIndex((l: any) => l.height === q);
                   if (idx !== -1) hls.currentLevel = idx;
                 }
               },
             };
-
             player.quality = 0;
           });
         }
+
       } catch (e: any) {
         if (!cancelled) {
           console.error("[VideoPlayer] Init error:", e.message);
@@ -254,21 +247,15 @@ export default function VideoPlayer({
     }
 
     init();
-
     return () => {
       cancelled = true;
       destroyPlayer();
     };
   }, [streamUrl, poster, title, referer, retryCount, destroyPlayer]);
 
-  // ── Retry handler ────────────────────────────────────────────
-  const handleRetry = () => {
-    setRetryCount((c) => c + 1);
-  };
-
   return (
     <div className="relative w-full rounded-2xl overflow-hidden ring-1 ring-white/10 shadow-2xl shadow-black/60 bg-black">
-      {/* Loading overlay */}
+
       {loading && !error && (
         <div className="absolute inset-0 flex items-center justify-center bg-black z-20 aspect-video">
           <div className="flex flex-col items-center gap-3">
@@ -278,7 +265,6 @@ export default function VideoPlayer({
         </div>
       )}
 
-      {/* Error state */}
       {error && (
         <div className="flex items-center justify-center bg-zinc-900 aspect-video">
           <div className="text-center px-6 flex flex-col items-center gap-4">
@@ -286,33 +272,29 @@ export default function VideoPlayer({
             <p className="text-white font-semibold">Stream Error</p>
             <p className="text-gray-400 text-sm max-w-xs">{error}</p>
             <button
-              onClick={handleRetry}
+              onClick={() => setRetryCount((c) => c + 1)}
               className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg transition-colors"
             >
-              <RefreshCw className="w-4 h-4" />
-              Retry
+              <RefreshCw className="w-4 h-4" /> Retry
             </button>
           </div>
         </div>
       )}
 
-      {/* Player */}
       <div
         className="aspect-video w-full"
-        style={
-          {
-            "--plyr-color-main": "#dc2626",
-            "--plyr-video-background": "#000",
-            "--plyr-menu-background": "#18181b",
-            "--plyr-menu-color": "#fff",
-            "--plyr-menu-border-color": "#27272a",
-            "--plyr-control-icon-size": "18px",
-            "--plyr-font-size-base": "14px",
-            "--plyr-tooltip-background": "#18181b",
-            "--plyr-tooltip-color": "#fff",
-            "--plyr-badge-background": "#dc2626",
-          } as React.CSSProperties
-        }
+        style={{
+          "--plyr-color-main":         "#dc2626",
+          "--plyr-video-background":   "#000",
+          "--plyr-menu-background":    "#18181b",
+          "--plyr-menu-color":         "#fff",
+          "--plyr-menu-border-color":  "#27272a",
+          "--plyr-control-icon-size":  "18px",
+          "--plyr-font-size-base":     "14px",
+          "--plyr-tooltip-background": "#18181b",
+          "--plyr-tooltip-color":      "#fff",
+          "--plyr-badge-background":   "#dc2626",
+        } as React.CSSProperties}
       >
         <video
           ref={videoRef}
