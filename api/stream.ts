@@ -1,8 +1,4 @@
 // api/stream.ts
-// Change: return the RAW m3u8 URL and referer to the browser
-// The browser will fetch the M3U8 directly (CDN allows browser IPs)
-// Then only route segments and keys through the proxy
-
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 interface StreamResponse {
@@ -14,8 +10,6 @@ interface StreamResponse {
   referer?:  string;
   headers?:  Record<string, string>;
   error?:    string;
-  // NEW: raw CDN url so browser can fetch it directly
-  rawM3u8?:  string;
 }
 
 interface PaheSearchResult {
@@ -112,9 +106,9 @@ function cleanTitle(title: string): string {
 }
 
 function scoreTitleMatch(
-  result:       PaheSearchResult,
+  result: PaheSearchResult,
   cleanedQuery: string,
-  seasonNum:    number
+  seasonNum: number
 ): number {
   const a = result.title.toLowerCase();
   const b = cleanedQuery.toLowerCase();
@@ -132,9 +126,9 @@ function scoreTitleMatch(
 
   const resultSeason = extractSeasonFromTitle(result.title);
   if (seasonNum > 1) {
-    if (resultSeason === seasonNum)      score += 50;
-    else if (resultSeason === null)      score -= 20;
-    else                                 score -= 40;
+    if (resultSeason === seasonNum)       score += 50;
+    else if (resultSeason === null)       score -= 20;
+    else                                  score -= 40;
 
     const want = [
       `season ${seasonNum}`,
@@ -145,7 +139,6 @@ function scoreTitleMatch(
   } else {
     if (resultSeason && resultSeason > 1) score -= 30;
   }
-
   return score;
 }
 
@@ -170,62 +163,49 @@ async function streamFromAnimePahe(
   seasonNum: number
 ): Promise<StreamResponse | null> {
 
-  // ── 1. Search ───────────────────────────────────────────────
+  // 1. Search
   const searchTitle = cleanTitle(title);
   console.log(`\n[AnimePahe] "${searchTitle}" S${seasonNum}E${episode} ${lang}`);
 
   let results: PaheSearchResult[];
   try {
     results = await fetchJson<PaheSearchResult[]>(
-      `${PAHE_API}/search?q=${encodeURIComponent(searchTitle)}`,
-      "search"
+      `${PAHE_API}/search?q=${encodeURIComponent(searchTitle)}`, "search"
     );
   } catch (err: any) {
     console.error("[AnimePahe] Search error:", err.message);
     return null;
   }
 
-  if (!Array.isArray(results) || !results.length) {
-    console.log("[AnimePahe] No results");
-    return null;
-  }
+  if (!Array.isArray(results) || !results.length) return null;
 
   const scored = results
     .map((r) => ({ r, score: scoreTitleMatch(r, searchTitle, seasonNum) }))
     .sort((a, b) => b.score - a.score);
 
-  console.log(
-    "[AnimePahe] Top:",
-    scored.slice(0, 3).map(({ r, score }) => `"${r.title}"(${score})`).join(" | ")
-  );
+  console.log("[AnimePahe] Top:", scored.slice(0, 3).map(({ r, score }) =>
+    `"${r.title}"(${score})`).join(" | "));
 
-  // ── 2. Find episode ─────────────────────────────────────────
+  // 2. Find episode
   let chosenAnime: PaheSearchResult | null = null;
   let episodes:    PaheEpisode[]           = [];
   let ep:          PaheEpisode | null      = null;
 
   for (const { r, score } of scored) {
     if (score < 20 && chosenAnime !== null) break;
-    console.log(`[AnimePahe] Trying: "${r.title}" (score ${score})`);
 
     let eps: PaheEpisode[];
     try {
       eps = await fetchJson<PaheEpisode[]>(
-        `${PAHE_API}/episodes?session=${r.session}`,
-        "episodes"
+        `${PAHE_API}/episodes?session=${r.session}`, "episodes"
       );
-    } catch (err: any) {
-      console.warn(`[AnimePahe] Episodes failed for "${r.title}":`, err.message);
-      continue;
-    }
+    } catch { continue; }
 
     if (!Array.isArray(eps) || !eps.length) continue;
 
     const found = eps.find((e) => e.number === episode);
     if (found) {
-      chosenAnime = r;
-      episodes    = eps;
-      ep          = found;
+      chosenAnime = r; episodes = eps; ep = found;
       console.log(`[AnimePahe] ✓ Found E${episode} in "${r.title}"`);
       break;
     }
@@ -237,7 +217,7 @@ async function streamFromAnimePahe(
     return null;
   }
 
-  // ── 3. Sources ──────────────────────────────────────────────
+  // 3. Sources
   let sources: PaheSource[];
   try {
     sources = await fetchJson<PaheSource[]>(
@@ -249,54 +229,45 @@ async function streamFromAnimePahe(
     return null;
   }
 
-  if (!Array.isArray(sources) || !sources.length) {
-    console.log("[AnimePahe] No sources");
-    return null;
-  }
+  if (!Array.isArray(sources) || !sources.length) return null;
 
   const source = pickSource(sources, lang);
   if (!source) return null;
 
-  console.log("[AnimePahe] Picked:", source.quality, source.audio);
+  console.log("[AnimePahe] Picked:", source.quality, source.audio, source.url);
 
-  // ── 4. M3U8 ────────────────────────────────────────────────
+  // 4. Get M3U8
   let m3u8Data: PaheM3u8Result;
   try {
     m3u8Data = await fetchJson<PaheM3u8Result>(
-      `${PAHE_API}/m3u8?url=${encodeURIComponent(source.url)}`,
-      "m3u8"
+      `${PAHE_API}/m3u8?url=${encodeURIComponent(source.url)}`, "m3u8"
     );
   } catch (err: any) {
     console.error("[AnimePahe] M3U8 error:", err.message);
     return null;
   }
 
-  if (!m3u8Data?.m3u8) {
-    console.log("[AnimePahe] No M3U8 URL");
-    return null;
-  }
+  if (!m3u8Data?.m3u8) return null;
 
   console.log("[AnimePahe] ✓ M3U8:", m3u8Data.m3u8.slice(0, 80));
 
   const referer    = m3u8Data.referer || "https://kwik.cx/";
   const audioLabel = source.audio === "eng" ? "Dub" : "Sub";
 
-  // Return BOTH the proxy URL and the raw CDN URL
-  // The browser will try the raw URL first (CDN allows browser IPs)
-  // and fall back to proxy if needed
+  // Return the proxy URL pointing to the fresh M3U8
+  const proxyUrl =
+    `/api/proxy` +
+    `?url=${encodeURIComponent(m3u8Data.m3u8)}` +
+    `&referer=${encodeURIComponent(referer)}`;
+
   return {
-    url:      m3u8Data.m3u8,   // ← raw CDN URL, browser fetches directly
-    rawM3u8:  m3u8Data.m3u8,
+    url:       proxyUrl,
     subtitles: [],
-    intro:    null,
-    outro:    null,
-    source:   `AnimePahe · ${source.quality} · ${audioLabel}`,
+    intro:     null,
+    outro:     null,
+    source:    `AnimePahe · ${source.quality} · ${audioLabel}`,
     referer,
-    headers:  {
-      ...m3u8Data.headers,
-      "Referer": referer,
-      "Origin":  "https://kwik.cx",
-    },
+    headers:   m3u8Data.headers ?? {},
   };
 }
 
@@ -310,7 +281,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: "Method not allowed" });
 
   const { title, episode, lang, season } = req.query;
-
   if (!title || typeof title !== "string")
     return res.status(400).json({ error: "title is required" });
 
@@ -329,22 +299,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     return res.status(200).json({
-      url:       null,
-      subtitles: [],
-      intro:     null,
-      outro:     null,
-      source:    null,
-      error:     "No stream found on AnimePahe",
+      url: null, subtitles: [], intro: null, outro: null,
+      source: null, error: "No stream found on AnimePahe",
     });
   } catch (err: any) {
     console.error("[stream] Error:", err.message);
     return res.status(500).json({
-      url:       null,
-      subtitles: [],
-      intro:     null,
-      outro:     null,
-      source:    null,
-      error:     "Internal server error",
+      url: null, subtitles: [], intro: null, outro: null,
+      source: null, error: "Internal server error",
     });
   }
 }
