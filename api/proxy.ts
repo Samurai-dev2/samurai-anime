@@ -3,7 +3,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const ALLOWED_HOSTS = [
   "uwucdn.top",
-  "owocdn.top",
+  "owocdn.top", 
   "kwik.cx",
   "animepahe.com",
   "animepahe.ru",
@@ -13,92 +13,113 @@ const ALLOWED_HOSTS = [
 function isAllowedUrl(url: string): boolean {
   try {
     const { hostname } = new URL(url);
-    return ALLOWED_HOSTS.some(
+    const allowed = ALLOWED_HOSTS.some(
       (h) => hostname === h || hostname.endsWith(`.${h}`)
     );
+    if (!allowed) {
+      // This log will appear in your Vercel logs
+      console.warn("[proxy] BLOCKED hostname:", hostname);
+    }
+    return allowed;
   } catch {
     return false;
   }
 }
 
-/**
- * Fetch the AES key server-side and return as a base64 data URI.
- * HLS.js supports data: URIs for EXT-X-KEY, so this avoids any
- * cross-origin key request from the browser entirely.
- */
+// ─────────────────────────────────────────────────────────────
+// This is the most important function.
+// It tries 3 different ways to fetch the encryption key.
+// If all 3 fail, we know the CDN is blocking server IPs entirely.
+// ─────────────────────────────────────────────────────────────
 async function fetchKeyAsDataUri(
   keyUrl: string,
   referer: string
 ): Promise<string | null> {
-  try {
+
+  // We try 3 different sets of headers.
+  // Some CDNs block requests with too many headers,
+  // some block requests with too few.
+  const attempts = [
+    // Attempt 1: Full browser-like headers
+    {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "*/*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Origin": "https://kwik.cx",
+      "Referer": referer,
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "cross-site",
+    },
+    // Attempt 2: Fewer headers
+    {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Referer": referer,
+      "Origin": "https://kwik.cx",
+    },
+    // Attempt 3: Bare minimum headers
+    {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Referer": referer,
+    },
+  ];
+
+  for (let i = 0; i < attempts.length; i++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
 
-    const res = await fetch(keyUrl, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-          "AppleWebKit/537.36 (KHTML, like Gecko) " +
-          "Chrome/120.0.0.0 Safari/537.36",
-        Accept: "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        Origin: "https://kwik.cx",
-        Referer: referer,
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site",
-      },
-    });
+    try {
+      console.log(`[proxy] Key fetch attempt ${i + 1} of 3: ${keyUrl}`);
 
-    clearTimeout(timer);
+      const res = await fetch(keyUrl, {
+        signal: controller.signal,
+        headers: attempts[i],
+      });
 
-    if (!res.ok) {
-      console.error("[proxy] Key fetch failed:", res.status, keyUrl.slice(0, 80));
-      return null;
+      clearTimeout(timer);
+
+      if (!res.ok) {
+        console.warn(`[proxy] Attempt ${i + 1} failed with HTTP ${res.status}`);
+        continue; // try the next set of headers
+      }
+
+      const buffer = await res.arrayBuffer();
+
+      if (buffer.byteLength === 0) {
+        console.warn(`[proxy] Attempt ${i + 1} returned empty body`);
+        continue;
+      }
+
+      // Success! Convert the key bytes to a data URI
+      const base64 = Buffer.from(buffer).toString("base64");
+      console.log(`[proxy] ✓ Key fetched on attempt ${i + 1} (${buffer.byteLength} bytes)`);
+      return `data:application/octet-stream;base64,${base64}`;
+
+    } catch (err: any) {
+      clearTimeout(timer);
+      const reason = err.name === "AbortError" ? "timed out" : err.message;
+      console.warn(`[proxy] Attempt ${i + 1} threw: ${reason}`);
+      // loop continues to next attempt
     }
-
-    const buffer = await res.arrayBuffer();
-
-    // Sanity-check: AES-128 keys are always exactly 16 bytes
-    if (buffer.byteLength === 0) {
-      console.error("[proxy] Key fetch returned empty body:", keyUrl.slice(0, 80));
-      return null;
-    }
-
-    if (buffer.byteLength !== 16) {
-      console.warn(
-        `[proxy] Key is ${buffer.byteLength} bytes (expected 16):`,
-        keyUrl.slice(0, 80)
-      );
-    }
-
-    const base64 = Buffer.from(buffer).toString("base64");
-    return `data:application/octet-stream;base64,${base64}`;
-  } catch (err: any) {
-    console.error("[proxy] Key fetch error:", err.message, keyUrl.slice(0, 80));
-    return null;
   }
+
+  // All 3 attempts failed
+  console.error("[proxy] ✗ All 3 key fetch attempts failed for:", keyUrl);
+  return null;
 }
 
-/**
- * Resolve a raw URL from the M3U8 to an absolute URL, then wrap it
- * in our proxy endpoint so the browser never makes a cross-origin request.
- */
 function toProxyUrl(
   rawUrl: string,
   base: URL,
   encodedRef: string,
   origin: string
 ): string {
-  // Already a data URI — return as-is (shouldn't happen for segments, but safe)
   if (rawUrl.startsWith("data:")) return rawUrl;
 
   let absolute: string;
   try {
     absolute = new URL(rawUrl, base).toString();
   } catch {
-    console.warn("[proxy] Could not resolve URL:", rawUrl);
     return rawUrl;
   }
 
@@ -119,169 +140,135 @@ async function rewriteM3u8(
 ): Promise<string> {
   const base = new URL(baseUrl);
   const encodedRef = encodeURIComponent(referer);
+  const proxy = (raw: string) => toProxyUrl(raw, base, encodedRef, origin);
 
   const lines = content.split("\n");
-  const result: string[] = [];
+  const out: string[] = [];
 
   for (const line of lines) {
-    const trimmed = line.trim();
+    const t = line.trim();
 
-    // ── Preserve empty lines exactly ──────────────────────
-    if (!trimmed) {
-      result.push(line);
+    // Empty line - keep as is
+    if (!t) {
+      out.push(line);
       continue;
     }
 
-    // ── #EXT-X-KEY — fetch key server-side, inline as data URI ──
-    if (trimmed.startsWith("#EXT-X-KEY")) {
-      const uriMatch = trimmed.match(/URI="([^"]+)"/);
+    // ── Encryption key line ───────────────────────────────
+    if (t.startsWith("#EXT-X-KEY")) {
+      const uriMatch = t.match(/URI="([^"]+)"/);
 
-      if (uriMatch) {
-        const rawKeyUrl = uriMatch[1];
-
-        // Skip if already a data URI (idempotent rewriting)
-        if (rawKeyUrl.startsWith("data:")) {
-          result.push(line);
-          continue;
-        }
-
-        let absoluteKeyUrl: string;
-        try {
-          absoluteKeyUrl = new URL(rawKeyUrl, base).toString();
-        } catch {
-          absoluteKeyUrl = rawKeyUrl;
-        }
-
-        console.log("[proxy] Fetching AES key:", absoluteKeyUrl.slice(0, 80));
-
-        const dataUri = await fetchKeyAsDataUri(absoluteKeyUrl, referer);
-
-        if (dataUri) {
-          // Replace only the URI attribute, preserve the rest of the tag
-          const rewritten = line.replace(/URI="[^"]*"/, `URI="${dataUri}"`);
-          result.push(rewritten);
-          console.log("[proxy] ✓ Key inlined as data URI");
-        } else {
-          // Fallback: proxy the key URL (browser will make a cross-origin
-          // request, but with CORS headers it should work)
-          const proxyKeyUrl = toProxyUrl(rawKeyUrl, base, encodedRef, origin);
-          const rewritten = line.replace(/URI="[^"]*"/, `URI="${proxyKeyUrl}"`);
-          result.push(rewritten);
-          console.warn("[proxy] ⚠ Key inline failed — using proxy URL fallback");
-        }
+      // No URI in this tag (e.g. METHOD=NONE) - keep as is
+      if (!uriMatch) {
+        out.push(line);
         continue;
       }
 
-      // No URI attribute — pass through (e.g. METHOD=NONE)
-      result.push(line);
+      const rawKeyUrl = uriMatch[1];
+
+      // Already a data URI - keep as is
+      if (rawKeyUrl.startsWith("data:")) {
+        out.push(line);
+        continue;
+      }
+
+      // Resolve to full URL
+      let absoluteKeyUrl: string;
+      try {
+        absoluteKeyUrl = new URL(rawKeyUrl, base).toString();
+      } catch {
+        absoluteKeyUrl = rawKeyUrl;
+      }
+
+      // Try to fetch and inline the key
+      const dataUri = await fetchKeyAsDataUri(absoluteKeyUrl, referer);
+
+      if (dataUri) {
+        // SUCCESS - replace the URL with actual key data
+        out.push(line.replace(/URI="[^"]*"/, `URI="${dataUri}"`));
+        console.log("[proxy] ✓ Key successfully inlined");
+      } else {
+        // FAILED - use proxy URL as last resort
+        // (this is what causes the 403 you are seeing)
+        console.warn("[proxy] ✗ Key inline failed! Using proxy URL fallback.");
+        console.warn("[proxy] The CDN may be blocking Vercel server IPs.");
+        out.push(line.replace(/URI="[^"]*"/, `URI="${proxy(rawKeyUrl)}"`));
+      }
       continue;
     }
 
-    // ── #EXT-X-MAP — proxy the init segment ──────────────
-    if (trimmed.startsWith("#EXT-X-MAP")) {
-      const rewritten = line.replace(
-        /URI="([^"]*)"/,
-        (_, mapUrl) => `URI="${toProxyUrl(mapUrl, base, encodedRef, origin)}"`
-      );
-      result.push(rewritten);
+    // ── Init segment ──────────────────────────────────────
+    if (t.startsWith("#EXT-X-MAP")) {
+      out.push(line.replace(/URI="([^"]*)"/, (_, u) => `URI="${proxy(u)}"`));
       continue;
     }
 
-    // ── Master playlist — rewrite child playlist URIs ─────
-    // EXT-X-STREAM-INF and EXT-X-MEDIA URI attributes
-    if (
-      trimmed.startsWith("#EXT-X-STREAM-INF") ||
-      trimmed.startsWith("#EXT-X-MEDIA")
-    ) {
-      // Rewrite any URI="..." attribute inside these tags
-      const rewritten = line.replace(
-        /URI="([^"]*)"/,
-        (_, u) => `URI="${toProxyUrl(u, base, encodedRef, origin)}"`
-      );
-      result.push(rewritten);
+    // ── Master playlist child entries ─────────────────────
+    if (t.startsWith("#EXT-X-STREAM-INF") || t.startsWith("#EXT-X-MEDIA")) {
+      out.push(line.replace(/URI="([^"]*)"/, (_, u) => `URI="${proxy(u)}"`));
       continue;
     }
 
-    // ── Other # directives — pass through unchanged ───────
-    if (trimmed.startsWith("#")) {
-      result.push(line);
+    // ── Any other # tag - keep as is ─────────────────────
+    if (t.startsWith("#")) {
+      out.push(line);
       continue;
     }
 
-    // ── Segment / playlist URI line ───────────────────────
-    // Guard: skip if somehow empty after trim (shouldn't happen here)
-    if (!trimmed) {
-      result.push(line);
-      continue;
-    }
-
-    result.push(toProxyUrl(trimmed, base, encodedRef, origin));
+    // ── Video segment URL - proxy it ──────────────────────
+    out.push(proxy(t));
   }
 
-  return result.join("\n");
+  return out.join("\n");
 }
 
-// ─── Main handler ─────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // CORS — allow all origins so the browser player can reach us
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range");
-  res.setHeader(
-    "Access-Control-Expose-Headers",
-    "Content-Length, Content-Range, Content-Type"
-  );
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Content-Type");
 
   if (req.method === "OPTIONS") return res.status(200).end();
   if (req.method !== "GET")
     return res.status(405).json({ error: "Method not allowed" });
 
-  // ── Validate params ───────────────────────────────────────
   const { url, referer } = req.query;
 
   if (!url || typeof url !== "string")
     return res.status(400).json({ error: "url param required" });
 
-  if (!isAllowedUrl(url)) {
-    console.warn("[proxy] Blocked host:", url.slice(0, 80));
+  if (!isAllowedUrl(url))
     return res.status(403).json({ error: "Host not allowed" });
-  }
 
-  // ── Derive the public origin of THIS server ───────────────
-  // Used to build absolute proxy URLs inside rewritten M3U8 files.
-  // Prefer the incoming Origin header; fall back to Host.
   const origin =
     (req.headers["origin"] as string | undefined) ||
     `https://${req.headers.host}`;
 
   const ref =
-    typeof referer === "string" && referer ? referer : "https://kwik.cx/";
+    typeof referer === "string" && referer.startsWith("http")
+      ? referer
+      : "https://kwik.cx/";
 
-  // ── Build upstream request headers ───────────────────────
   const upstreamHeaders: Record<string, string> = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-      "AppleWebKit/537.36 (KHTML, like Gecko) " +
-      "Chrome/120.0.0.0 Safari/537.36",
-    Accept: "*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    Origin: "https://kwik.cx",
-    Referer: ref,
+    "Origin": "https://kwik.cx",
+    "Referer": ref,
     "Sec-Fetch-Dest": "empty",
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "cross-site",
-    Connection: "keep-alive",
+    "Connection": "keep-alive",
   };
 
-  // Forward Range header for byte-range / partial content requests
   if (req.headers.range) {
     upstreamHeaders["Range"] = req.headers.range as string;
   }
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30_000);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
 
+  try {
     const upstream = await fetch(url, {
       signal: controller.signal,
       headers: upstreamHeaders,
@@ -290,14 +277,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     clearTimeout(timer);
 
     if (!upstream.ok && upstream.status !== 206) {
-      console.error("[proxy] Upstream error:", upstream.status, url.slice(0, 80));
-      return res
-        .status(upstream.status)
-        .json({ error: `Upstream returned ${upstream.status}` });
+      console.error("[proxy] Upstream error:", upstream.status, url.slice(0, 100));
+      return res.status(upstream.status).json({ error: `Upstream returned ${upstream.status}` });
     }
 
     const contentType =
-      upstream.headers.get("content-type") || "application/octet-stream";
+      upstream.headers.get("content-type") ?? "application/octet-stream";
 
     const isM3u8 =
       url.includes(".m3u8") ||
@@ -308,43 +293,46 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (isM3u8) {
       const text = await upstream.text();
 
-      if (!text.trim().startsWith("#EXTM3U")) {
-        console.error("[proxy] Response is not a valid M3U8:", text.slice(0, 120));
+      if (!text.trimStart().startsWith("#EXTM3U")) {
+        console.error("[proxy] Not a valid M3U8:", text.slice(0, 120));
         return res.status(502).json({ error: "Upstream did not return a valid M3U8" });
       }
 
       const rewritten = await rewriteM3u8(text, url, ref, origin);
 
-      console.log("[proxy] ✓ M3U8 served:", url.slice(0, 80));
-
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache, no-store");
+      console.log("[proxy] ✓ M3U8 served:", url.slice(0, 100));
       return res.status(200).send(rewritten);
     }
 
-    // ── Binary segment / init segment / key ──────────────
+    // ── Binary (video segments, key files, etc.) ──────────
     const buffer = await upstream.arrayBuffer();
     const status = upstream.status === 206 ? 206 : 200;
 
-    const responseHeaders: Record<string, string | number> = {
+    const responseHeaders: Record<string, string> = {
       "Content-Type": contentType,
       "Cache-Control": "public, max-age=3600",
     };
 
-    const contentLength = upstream.headers.get("content-length");
-    if (contentLength) responseHeaders["Content-Length"] = contentLength;
+    const cl = upstream.headers.get("content-length");
+    if (cl) responseHeaders["Content-Length"] = cl;
 
-    const contentRange = upstream.headers.get("content-range");
-    if (contentRange) responseHeaders["Content-Range"] = contentRange;
+    const cr = upstream.headers.get("content-range");
+    if (cr) responseHeaders["Content-Range"] = cr;
 
     res.writeHead(status, responseHeaders);
     res.end(Buffer.from(buffer));
+
   } catch (err: any) {
+    clearTimeout(timer);
+
     if (err.name === "AbortError") {
-      console.error("[proxy] Upstream timed out:", url.slice(0, 80));
-      return res.status(504).json({ error: "Upstream request timed out" });
+      console.error("[proxy] Timed out:", url.slice(0, 100));
+      return res.status(504).json({ error: "Request timed out" });
     }
-    console.error("[proxy] Unexpected error:", err.message);
+
+    console.error("[proxy] Error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 }
