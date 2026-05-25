@@ -19,21 +19,17 @@ interface VideoPlayerProps {
 function loadStylesheet(id: string, href: string): void {
   if (document.getElementById(id)) return;
   const link = document.createElement("link");
-  link.id    = id;
-  link.rel   = "stylesheet";
-  link.href  = href;
+  link.id = id; link.rel = "stylesheet"; link.href = href;
   document.head.appendChild(link);
 }
 
 function loadScript(id: string, src: string): Promise<void> {
   return new Promise((resolve, reject) => {
     if (document.getElementById(id)) { resolve(); return; }
-    const s    = document.createElement("script");
-    s.id       = id;
-    s.src      = src;
-    s.async    = true;
-    s.onload   = () => resolve();
-    s.onerror  = () => reject(new Error(`Failed to load: ${src}`));
+    const s = document.createElement("script");
+    s.id = id; s.src = src; s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`Failed to load: ${src}`));
     document.head.appendChild(s);
   });
 }
@@ -42,43 +38,103 @@ let libsCache: Promise<{ Plyr: any; Hls: any }> | null = null;
 function loadLibs(): Promise<{ Plyr: any; Hls: any }> {
   if (libsCache) return libsCache;
   libsCache = (async () => {
-    loadStylesheet(
-      "plyr-css",
-      "https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css"
-    );
-    await loadScript(
-      "hls-script",
-      "https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"
-    );
-    await loadScript(
-      "plyr-script",
-      "https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.min.js"
-    );
+    loadStylesheet("plyr-css", "https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css");
+    await loadScript("hls-script", "https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js");
+    await loadScript("plyr-script", "https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.min.js");
     return { Plyr: (window as any).Plyr, Hls: (window as any).Hls };
   })();
   return libsCache;
 }
 
-// Route these through our proxy — everything else goes direct
-function shouldProxy(url: string): boolean {
-  try {
-    const { hostname } = new URL(url);
-    return (
-      hostname.endsWith(".uwucdn.top") ||
-      hostname.endsWith(".owocdn.top") ||
-      hostname === "kwik.cx"
-    );
-  } catch {
-    return false;
-  }
-}
-
-function toProxyUrl(url: string, referer: string): string {
+// Build a proxy URL for a CDN resource
+function proxyUrl(cdnUrl: string, referer: string): string {
   return (
     `${window.location.origin}/api/proxy` +
-    `?url=${encodeURIComponent(url)}` +
+    `?url=${encodeURIComponent(cdnUrl)}` +
     `&referer=${encodeURIComponent(referer)}`
   );
+}
+
+// Fetch the M3U8 directly from the browser (bypasses Vercel IP blocks)
+// then rewrite all segment/key URLs to go through our proxy
+async function fetchAndRewriteM3u8(
+  m3u8Url: string,
+  referer:  string
+): Promise<string> {
+  console.log("[M3U8] Fetching directly from browser:", m3u8Url.slice(0, 80));
+
+  // Browser fetch — CDN allows this, blocks server IPs
+  const res = await fetch(m3u8Url, {
+    headers: {
+      "Origin":  "https://kwik.cx",
+      "Referer": referer,
+    },
+    // mode: "cors" is default
+  });
+
+  if (!res.ok) {
+    throw new Error(`M3U8 fetch failed: HTTP ${res.status}`);
+  }
+
+  const text = await res.text();
+  console.log("[M3U8] Got response, length:", text.length, "starts with:", text.slice(0, 20));
+
+  if (!text.trimStart().startsWith("#EXTM3U")) {
+    throw new Error(`Not a valid M3U8. Got: ${text.slice(0, 100)}`);
+  }
+
+  const base = new URL(m3u8Url);
+  const lines = text.split("\n");
+  const out: string[] = [];
+
+  for (const line of lines) {
+    const t = line.trim();
+
+    if (!t) { out.push(line); continue; }
+
+    // Encryption key — route through proxy
+    if (t.startsWith("#EXT-X-KEY")) {
+      const match = t.match(/URI="([^"]+)"/);
+      if (match && !match[1].startsWith("data:")) {
+        let absKey: string;
+        try { absKey = new URL(match[1], base).toString(); }
+        catch { absKey = match[1]; }
+        const rewritten = line.replace(
+          /URI="[^"]*"/,
+          `URI="${proxyUrl(absKey, referer)}"`
+        );
+        out.push(rewritten);
+      } else {
+        out.push(line);
+      }
+      continue;
+    }
+
+    // Init segment — route through proxy
+    if (t.startsWith("#EXT-X-MAP")) {
+      out.push(
+        line.replace(/URI="([^"]*)"/, (_, u) => {
+          let abs: string;
+          try { abs = new URL(u, base).toString(); }
+          catch { abs = u; }
+          return `URI="${proxyUrl(abs, referer)}"`;
+        })
+      );
+      continue;
+    }
+
+    // Other tags — pass through
+    if (t.startsWith("#")) { out.push(line); continue; }
+
+    // Segment URL — route through proxy
+    let absSegment: string;
+    try { absSegment = new URL(t, base).toString(); }
+    catch { absSegment = t; }
+
+    out.push(proxyUrl(absSegment, referer));
+  }
+
+  return out.join("\n");
 }
 
 export default function VideoPlayer({
@@ -91,6 +147,8 @@ export default function VideoPlayer({
   const videoRef     = useRef<HTMLVideoElement>(null);
   const plyrRef      = useRef<any>(null);
   const hlsRef       = useRef<any>(null);
+  const blobRef      = useRef<string | null>(null); // track blob URL to revoke it
+
   const [error,      setError]      = useState<string | null>(null);
   const [loading,    setLoading]    = useState(true);
   const [retryCount, setRetryCount] = useState(0);
@@ -103,6 +161,11 @@ export default function VideoPlayer({
     if (hlsRef.current) {
       try { hlsRef.current.destroy(); } catch { /* ignore */ }
       hlsRef.current = null;
+    }
+    // Clean up blob URL to free memory
+    if (blobRef.current) {
+      URL.revokeObjectURL(blobRef.current);
+      blobRef.current = null;
     }
   }, []);
 
@@ -122,17 +185,47 @@ export default function VideoPlayer({
         if (cancelled || !videoRef.current) return;
 
         const video = videoRef.current;
+        const ref   = referer || "https://kwik.cx/";
 
-        // The referer to send with all CDN requests
-        const ref = referer || "https://kwik.cx/";
-
-        // Make the initial M3U8 URL absolute
-        const absoluteUrl = streamUrl.startsWith("/")
+        // Make sure we have an absolute URL
+        const absoluteM3u8 = streamUrl.startsWith("/")
           ? `${window.location.origin}${streamUrl}`
           : streamUrl;
 
-        console.log("[VideoPlayer] Loading:", absoluteUrl.slice(0, 100));
+        // ── Step 1: Fetch and rewrite M3U8 in the browser ────
+        // This works because the browser is not blocked by the CDN
+        // The server (Vercel IP) is blocked, but the browser is not
+        let hlsSource: string;
 
+        try {
+          console.log("[VideoPlayer] Fetching M3U8 from browser...");
+          const rewrittenM3u8 = await fetchAndRewriteM3u8(absoluteM3u8, ref);
+
+          // Create a blob URL from the rewritten M3U8
+          // HLS.js will use this as its source — all segment URLs
+          // inside it point to our proxy so they work fine
+          const blob = new Blob([rewrittenM3u8], {
+            type: "application/vnd.apple.mpegurl",
+          });
+          const blobUrl    = URL.createObjectURL(blob);
+          blobRef.current  = blobUrl;
+          hlsSource        = blobUrl;
+
+          console.log("[VideoPlayer] ✓ M3U8 rewritten, blob URL created");
+          console.log("[VideoPlayer] Rewritten M3U8 preview:", rewrittenM3u8.slice(0, 300));
+
+        } catch (fetchErr: any) {
+          // If direct browser fetch fails (CORS error), fall back to proxy
+          console.warn(
+            "[VideoPlayer] Direct fetch failed:", fetchErr.message,
+            "— falling back to proxy URL"
+          );
+          hlsSource = proxyUrl(absoluteM3u8, ref);
+        }
+
+        if (cancelled) return;
+
+        // ── Step 2: Feed to HLS.js ────────────────────────────
         if (Hls.isSupported()) {
           const hls = new Hls({
             enableWorker:    true,
@@ -141,30 +234,16 @@ export default function VideoPlayer({
             manifestLoadingTimeOut: 20_000,
             levelLoadingTimeOut:    20_000,
             fragLoadingTimeOut:     30_000,
-            manifestLoadingMaxRetry: 2,
-            levelLoadingMaxRetry:    2,
+            manifestLoadingMaxRetry: 1,
+            levelLoadingMaxRetry:    1,
             fragLoadingMaxRetry:     2,
-
-            // ── KEY: intercept every XHR HLS.js makes ──────
-            // If the URL is a CDN URL (uwucdn.top etc) route it
-            // through our proxy so the browser never makes a
-            // direct cross-origin request that the CDN blocks
-            xhrSetup(xhr: XMLHttpRequest, url: string) {
-              if (shouldProxy(url)) {
-                // Reopen the XHR to the proxy URL instead
-                const proxied = toProxyUrl(url, ref);
-                console.log("[HLS] Routing through proxy:", url.slice(0, 60));
-                xhr.open("GET", proxied, true);
-              }
-              // If it is already a proxy URL — leave it alone
-            },
           });
 
           hlsRef.current = hls;
 
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (cancelled) return;
-            console.log("[VideoPlayer] ✓ Manifest parsed");
+            console.log("[VideoPlayer] ✓ HLS manifest parsed");
             setLoading(false);
           });
 
@@ -176,14 +255,11 @@ export default function VideoPlayer({
               "| fatal:", data.fatal,
               "| url:", (data.url || "").slice(0, 80)
             );
-
             if (!data.fatal) return;
 
             if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-              console.error("[VideoPlayer] Fatal network error — startLoad()");
               hls.startLoad();
             } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-              console.error("[VideoPlayer] Fatal media error — recoverMediaError()");
               hls.recoverMediaError();
             } else {
               setError("Stream failed to load. Please try again.");
@@ -191,18 +267,12 @@ export default function VideoPlayer({
             }
           });
 
-          // If the M3U8 URL is a CDN URL, route it through proxy first
-          const sourceUrl = shouldProxy(absoluteUrl)
-            ? toProxyUrl(absoluteUrl, ref)
-            : absoluteUrl;
-
-          console.log("[VideoPlayer] Source URL for HLS:", sourceUrl.slice(0, 100));
-          hls.loadSource(sourceUrl);
+          console.log("[VideoPlayer] Loading HLS source:", hlsSource.slice(0, 80));
+          hls.loadSource(hlsSource);
           hls.attachMedia(video);
 
         } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-          // Safari native HLS
-          video.src = absoluteUrl;
+          video.src = hlsSource;
           video.addEventListener(
             "loadedmetadata",
             () => { if (!cancelled) setLoading(false); },
@@ -210,12 +280,7 @@ export default function VideoPlayer({
           );
           video.addEventListener(
             "error",
-            () => {
-              if (!cancelled) {
-                setError("Failed to load stream.");
-                setLoading(false);
-              }
-            },
+            () => { if (!cancelled) { setError("Failed to load stream."); setLoading(false); } },
             { once: true }
           );
         } else {
@@ -224,7 +289,7 @@ export default function VideoPlayer({
           return;
         }
 
-        // ── Plyr UI ────────────────────────────────────────
+        // ── Step 3: Plyr UI ───────────────────────────────────
         const player = new Plyr(video, {
           title:    title || "Anime",
           controls: [
@@ -247,16 +312,13 @@ export default function VideoPlayer({
             if (cancelled) return;
             const levels: number[] = hls.levels.map((l: any) => l.height);
             player.config.quality = {
-              default:  0,
-              options:  [0, ...levels],
-              forced:   true,
+              default: 0,
+              options: [0, ...levels],
+              forced:  true,
               onChange(q: number) {
-                if (q === 0) {
-                  hls.currentLevel = -1;
-                } else {
-                  const idx = hls.levels.findIndex((l: any) => l.height === q);
-                  if (idx !== -1) hls.currentLevel = idx;
-                }
+                hls.currentLevel = q === 0
+                  ? -1
+                  : hls.levels.findIndex((l: any) => l.height === q);
               },
             };
             player.quality = 0;
