@@ -338,3 +338,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: err.message });
   }
 }
+
+
+if (isM3u8) {
+  const text = await upstream.text();
+
+  // ADD THIS LINE - it prints what the CDN actually sent back
+  console.log("[proxy] RAW RESPONSE:", upstream.status, JSON.stringify(text.slice(0, 500)));
+
+  if (!text.trimStart().startsWith("#EXTM3U")) {
+    console.error("[proxy] Invalid M3U8:", text.slice(0, 300));
+    return res.status(502).json({
+      error: "Upstream did not return a valid M3U8",
+      preview: text.slice(0, 300),  // ← this will show in browser too
+    });
+  }
