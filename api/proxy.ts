@@ -69,7 +69,7 @@ async function fetchKeyAsDataUri(
         console.warn(`[proxy] Key attempt ${i + 1} got empty body`);
         continue;
       }
-      console.log(`[proxy] ✓ Key got on attempt ${i + 1} — ${buf.byteLength} bytes`);
+      console.log(`[proxy] ✓ Key fetched on attempt ${i + 1} — ${buf.byteLength} bytes`);
       const b64 = Buffer.from(buf).toString("base64");
       return `data:application/octet-stream;base64,${b64}`;
     } catch (err: any) {
@@ -85,15 +85,10 @@ async function fetchKeyAsDataUri(
   return null;
 }
 
-// ─── THIS IS THE CRITICAL FUNCTION ───────────────────────────
-// Segment URLs MUST be absolute (https://...) not relative (/api/proxy?...)
-// because HLS.js resolves relative URLs against its internal blob: base URL
-// which breaks everything
 function toAbsoluteProxyUrl(
   rawUrl: string,
   base: URL,
   encodedRef: string,
-  // This MUST be the full public URL of your site e.g. https://samurai-anime-nine.vercel.app
   publicOrigin: string
 ): string {
   if (rawUrl.startsWith("data:")) return rawUrl;
@@ -108,7 +103,6 @@ function toAbsoluteProxyUrl(
 
   if (!abs.startsWith("http")) return rawUrl;
 
-  // MUST be absolute - HLS.js will break with relative URLs
   return (
     `${publicOrigin}/api/proxy` +
     `?url=${encodeURIComponent(abs)}` +
@@ -120,7 +114,7 @@ async function rewriteM3u8(
   content: string,
   baseUrl: string,
   referer: string,
-  publicOrigin: string // e.g. https://samurai-anime-nine.vercel.app
+  publicOrigin: string
 ): Promise<string> {
   const base = new URL(baseUrl);
   const encodedRef = encodeURIComponent(referer);
@@ -133,13 +127,11 @@ async function rewriteM3u8(
   for (const line of lines) {
     const t = line.trim();
 
-    // Empty line — preserve exactly
     if (!t) {
       out.push(line);
       continue;
     }
 
-    // Encryption key
     if (t.startsWith("#EXT-X-KEY")) {
       const match = t.match(/URI="([^"]+)"/);
       if (!match) {
@@ -162,32 +154,27 @@ async function rewriteM3u8(
         out.push(line.replace(/URI="[^"]*"/, `URI="${dataUri}"`));
         console.log("[proxy] ✓ Key inlined as data URI");
       } else {
-        // Fallback to proxy URL — at least it will go through our server
         out.push(line.replace(/URI="[^"]*"/, `URI="${proxy(rawKey)}"`));
         console.warn("[proxy] Key inline failed — using proxy URL fallback");
       }
       continue;
     }
 
-    // Init segment
     if (t.startsWith("#EXT-X-MAP")) {
       out.push(line.replace(/URI="([^"]*)"/, (_, u) => `URI="${proxy(u)}"`));
       continue;
     }
 
-    // Master playlist variant / rendition tags
     if (t.startsWith("#EXT-X-STREAM-INF") || t.startsWith("#EXT-X-MEDIA")) {
       out.push(line.replace(/URI="([^"]*)"/, (_, u) => `URI="${proxy(u)}"`));
       continue;
     }
 
-    // Any other tag — pass through
     if (t.startsWith("#")) {
       out.push(line);
       continue;
     }
 
-    // Segment URL line — MUST be absolute proxy URL
     out.push(proxy(t));
   }
 
@@ -215,28 +202,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!isAllowedUrl(url))
     return res.status(403).json({ error: "Host not allowed" });
 
-  // ── Derive the public origin ────────────────────────────────
-  // This is used to build absolute proxy URLs inside M3U8 files.
-  // HLS.js NEEDS absolute URLs — relative ones get resolved against
-  // the blob: URL that HLS.js uses internally, causing 404 errors.
-  //
-  // We hardcode the production URL as the ultimate fallback so this
-  // never produces a broken relative URL.
-  const host = req.headers.host || "";
+  const host = req.headers.host || "samurai-anime-nine.vercel.app";
   const proto = host.includes("localhost") ? "http" : "https";
   const publicOrigin = `${proto}://${host}`;
-
-  console.log("[proxy] publicOrigin:", publicOrigin);
-  console.log("[proxy] Fetching:", url.slice(0, 100));
 
   const ref =
     typeof referer === "string" && referer.startsWith("http")
       ? referer
       : "https://kwik.cx/";
 
+  console.log("[proxy] publicOrigin:", publicOrigin);
+  console.log("[proxy] Fetching:", url.slice(0, 100));
+
   const upstreamHeaders: Record<string, string> = {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://kwik.cx",
@@ -283,28 +262,30 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       contentType.includes("mpegurl") ||
       contentType.includes("x-mpegURL");
 
-    // ── M3U8 ───────────────────────────────────────────────
+    // ── M3U8 — only one block, with debug logging ──────────
     if (isM3u8) {
       const text = await upstream.text();
 
+      // Debug: print exactly what the CDN sent back
       console.log(
-        "[proxy] M3U8 preview:",
-        text.slice(0, 150).replace(/\n/g, " | ")
+        "[proxy] RAW RESPONSE:",
+        upstream.status,
+        JSON.stringify(text.slice(0, 500))
       );
 
       if (!text.trimStart().startsWith("#EXTM3U")) {
-        console.error("[proxy] Invalid M3U8 content:", text.slice(0, 300));
+        console.error("[proxy] Invalid M3U8:", text.slice(0, 300));
         return res.status(502).json({
           error: "Upstream did not return a valid M3U8",
+          // This shows in browser so you can see what the CDN returned
           preview: text.slice(0, 300),
         });
       }
 
       const rewritten = await rewriteM3u8(text, url, ref, publicOrigin);
 
-      // Log a few lines of the rewritten M3U8 so we can verify URLs are absolute
       const firstFewLines = rewritten.split("\n").slice(0, 10).join("\n");
-      console.log("[proxy] Rewritten M3U8 (first 10 lines):\n", firstFewLines);
+      console.log("[proxy] Rewritten M3U8 first 10 lines:\n", firstFewLines);
 
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache, no-store");
@@ -328,6 +309,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     res.writeHead(status, responseHeaders);
     res.end(Buffer.from(buffer));
+
   } catch (err: any) {
     clearTimeout(timer);
     if (err.name === "AbortError") {
@@ -338,18 +320,3 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(500).json({ error: err.message });
   }
 }
-
-
-if (isM3u8) {
-  const text = await upstream.text();
-
-  // ADD THIS LINE - it prints what the CDN actually sent back
-  console.log("[proxy] RAW RESPONSE:", upstream.status, JSON.stringify(text.slice(0, 500)));
-
-  if (!text.trimStart().startsWith("#EXTM3U")) {
-    console.error("[proxy] Invalid M3U8:", text.slice(0, 300));
-    return res.status(502).json({
-      error: "Upstream did not return a valid M3U8",
-      preview: text.slice(0, 300),  // ← this will show in browser too
-    });
-  }
