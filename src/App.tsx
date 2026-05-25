@@ -1,5 +1,6 @@
 
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
+import TestStreamPage from "./pages/TestStreamPage";
 import { ClerkProvider, useAuth } from "@clerk/clerk-react";
 import Navbar from "./components/Navbar";
 import HomePage from "./pages/HomePage";
@@ -102,6 +103,7 @@ function AppContent() {
               </ProtectedRoute>
             }
           />
+          <Route path="/test-stream" element={<TestStreamPage />} />
           <Route
             path="/library"
             element={
