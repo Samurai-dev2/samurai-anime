@@ -3,7 +3,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const ALLOWED_HOSTS = [
   "uwucdn.top",
-  "owocdn.top", 
+  "owocdn.top",
   "kwik.cx",
   "animepahe.com",
   "animepahe.ru",
@@ -13,34 +13,23 @@ const ALLOWED_HOSTS = [
 function isAllowedUrl(url: string): boolean {
   try {
     const { hostname } = new URL(url);
-    const allowed = ALLOWED_HOSTS.some(
+    const ok = ALLOWED_HOSTS.some(
       (h) => hostname === h || hostname.endsWith(`.${h}`)
     );
-    if (!allowed) {
-      // This log will appear in your Vercel logs
-      console.warn("[proxy] BLOCKED hostname:", hostname);
-    }
-    return allowed;
+    if (!ok) console.warn("[proxy] Blocked hostname:", hostname);
+    return ok;
   } catch {
+    console.warn("[proxy] Could not parse URL:", url);
     return false;
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// This is the most important function.
-// It tries 3 different ways to fetch the encryption key.
-// If all 3 fail, we know the CDN is blocking server IPs entirely.
-// ─────────────────────────────────────────────────────────────
 async function fetchKeyAsDataUri(
   keyUrl: string,
   referer: string
 ): Promise<string | null> {
-
-  // We try 3 different sets of headers.
-  // Some CDNs block requests with too many headers,
-  // some block requests with too few.
-  const attempts = [
-    // Attempt 1: Full browser-like headers
+  // Try different header combinations because CDNs vary in what they accept
+  const headerSets = [
     {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Accept": "*/*",
@@ -51,60 +40,56 @@ async function fetchKeyAsDataUri(
       "Sec-Fetch-Mode": "cors",
       "Sec-Fetch-Site": "cross-site",
     },
-    // Attempt 2: Fewer headers
     {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Referer": referer,
       "Origin": "https://kwik.cx",
+      "Referer": referer,
     },
-    // Attempt 3: Bare minimum headers
     {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Referer": referer,
     },
   ];
 
-  for (let i = 0; i < attempts.length; i++) {
+  for (let i = 0; i < headerSets.length; i++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
 
     try {
-      console.log(`[proxy] Key fetch attempt ${i + 1} of 3: ${keyUrl}`);
+      console.log(`[proxy] Key attempt ${i + 1}/3:`, keyUrl.slice(0, 80));
 
       const res = await fetch(keyUrl, {
         signal: controller.signal,
-        headers: attempts[i],
+        headers: headerSets[i],
       });
 
       clearTimeout(timer);
 
       if (!res.ok) {
-        console.warn(`[proxy] Attempt ${i + 1} failed with HTTP ${res.status}`);
-        continue; // try the next set of headers
-      }
-
-      const buffer = await res.arrayBuffer();
-
-      if (buffer.byteLength === 0) {
-        console.warn(`[proxy] Attempt ${i + 1} returned empty body`);
+        console.warn(`[proxy] Key attempt ${i + 1} got HTTP ${res.status}`);
         continue;
       }
 
-      // Success! Convert the key bytes to a data URI
-      const base64 = Buffer.from(buffer).toString("base64");
-      console.log(`[proxy] ✓ Key fetched on attempt ${i + 1} (${buffer.byteLength} bytes)`);
-      return `data:application/octet-stream;base64,${base64}`;
+      const buf = await res.arrayBuffer();
+      if (buf.byteLength === 0) {
+        console.warn(`[proxy] Key attempt ${i + 1} got empty body`);
+        continue;
+      }
+
+      console.log(`[proxy] ✓ Key got on attempt ${i + 1} — ${buf.byteLength} bytes`);
+      const b64 = Buffer.from(buf).toString("base64");
+      return `data:application/octet-stream;base64,${b64}`;
 
     } catch (err: any) {
       clearTimeout(timer);
-      const reason = err.name === "AbortError" ? "timed out" : err.message;
-      console.warn(`[proxy] Attempt ${i + 1} threw: ${reason}`);
-      // loop continues to next attempt
+      console.warn(
+        `[proxy] Key attempt ${i + 1} threw:`,
+        err.name === "AbortError" ? "timeout" : err.message
+      );
     }
   }
 
-  // All 3 attempts failed
-  console.error("[proxy] ✗ All 3 key fetch attempts failed for:", keyUrl);
+  console.error("[proxy] ✗ All key fetch attempts failed:", keyUrl.slice(0, 80));
   return null;
 }
 
@@ -115,21 +100,14 @@ function toProxyUrl(
   origin: string
 ): string {
   if (rawUrl.startsWith("data:")) return rawUrl;
-
-  let absolute: string;
+  let abs: string;
   try {
-    absolute = new URL(rawUrl, base).toString();
+    abs = new URL(rawUrl, base).toString();
   } catch {
     return rawUrl;
   }
-
-  if (!absolute.startsWith("http")) return rawUrl;
-
-  return (
-    `${origin}/api/proxy` +
-    `?url=${encodeURIComponent(absolute)}` +
-    `&referer=${encodedRef}`
-  );
+  if (!abs.startsWith("http")) return rawUrl;
+  return `${origin}/api/proxy?url=${encodeURIComponent(abs)}&referer=${encodedRef}`;
 }
 
 async function rewriteM3u8(
@@ -148,74 +126,59 @@ async function rewriteM3u8(
   for (const line of lines) {
     const t = line.trim();
 
-    // Empty line - keep as is
     if (!t) {
       out.push(line);
       continue;
     }
 
-    // ── Encryption key line ───────────────────────────────
     if (t.startsWith("#EXT-X-KEY")) {
-      const uriMatch = t.match(/URI="([^"]+)"/);
-
-      // No URI in this tag (e.g. METHOD=NONE) - keep as is
-      if (!uriMatch) {
+      const match = t.match(/URI="([^"]+)"/);
+      if (!match) {
         out.push(line);
         continue;
       }
 
-      const rawKeyUrl = uriMatch[1];
+      const rawKey = match[1];
 
-      // Already a data URI - keep as is
-      if (rawKeyUrl.startsWith("data:")) {
+      if (rawKey.startsWith("data:")) {
         out.push(line);
         continue;
       }
 
-      // Resolve to full URL
-      let absoluteKeyUrl: string;
+      let absKey: string;
       try {
-        absoluteKeyUrl = new URL(rawKeyUrl, base).toString();
+        absKey = new URL(rawKey, base).toString();
       } catch {
-        absoluteKeyUrl = rawKeyUrl;
+        absKey = rawKey;
       }
 
-      // Try to fetch and inline the key
-      const dataUri = await fetchKeyAsDataUri(absoluteKeyUrl, referer);
+      const dataUri = await fetchKeyAsDataUri(absKey, referer);
 
       if (dataUri) {
-        // SUCCESS - replace the URL with actual key data
         out.push(line.replace(/URI="[^"]*"/, `URI="${dataUri}"`));
-        console.log("[proxy] ✓ Key successfully inlined");
+        console.log("[proxy] ✓ Key inlined");
       } else {
-        // FAILED - use proxy URL as last resort
-        // (this is what causes the 403 you are seeing)
-        console.warn("[proxy] ✗ Key inline failed! Using proxy URL fallback.");
-        console.warn("[proxy] The CDN may be blocking Vercel server IPs.");
-        out.push(line.replace(/URI="[^"]*"/, `URI="${proxy(rawKeyUrl)}"`));
+        out.push(line.replace(/URI="[^"]*"/, `URI="${proxy(rawKey)}"`));
+        console.warn("[proxy] Key inline failed — using proxy fallback");
       }
       continue;
     }
 
-    // ── Init segment ──────────────────────────────────────
     if (t.startsWith("#EXT-X-MAP")) {
       out.push(line.replace(/URI="([^"]*)"/, (_, u) => `URI="${proxy(u)}"`));
       continue;
     }
 
-    // ── Master playlist child entries ─────────────────────
     if (t.startsWith("#EXT-X-STREAM-INF") || t.startsWith("#EXT-X-MEDIA")) {
       out.push(line.replace(/URI="([^"]*)"/, (_, u) => `URI="${proxy(u)}"`));
       continue;
     }
 
-    // ── Any other # tag - keep as is ─────────────────────
     if (t.startsWith("#")) {
       out.push(line);
       continue;
     }
 
-    // ── Video segment URL - proxy it ──────────────────────
     out.push(proxy(t));
   }
 
@@ -269,6 +232,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const timer = setTimeout(() => controller.abort(), 30_000);
 
   try {
+    console.log("[proxy] Fetching:", url.slice(0, 100));
+
     const upstream = await fetch(url, {
       signal: controller.signal,
       headers: upstreamHeaders,
@@ -276,9 +241,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     clearTimeout(timer);
 
+    console.log("[proxy] Upstream status:", upstream.status, "for:", url.slice(0, 80));
+
     if (!upstream.ok && upstream.status !== 206) {
-      console.error("[proxy] Upstream error:", upstream.status, url.slice(0, 100));
-      return res.status(upstream.status).json({ error: `Upstream returned ${upstream.status}` });
+      return res
+        .status(upstream.status)
+        .json({ error: `Upstream returned ${upstream.status}` });
     }
 
     const contentType =
@@ -289,24 +257,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       contentType.includes("mpegurl") ||
       contentType.includes("x-mpegURL");
 
-    // ── M3U8 playlist ─────────────────────────────────────
     if (isM3u8) {
       const text = await upstream.text();
 
+      console.log("[proxy] M3U8 first 100 chars:", text.slice(0, 100).replace(/\n/g, "\\n"));
+
       if (!text.trimStart().startsWith("#EXTM3U")) {
-        console.error("[proxy] Not a valid M3U8:", text.slice(0, 120));
-        return res.status(502).json({ error: "Upstream did not return a valid M3U8" });
+        console.error("[proxy] Not a valid M3U8! Got:", text.slice(0, 200));
+        return res.status(502).json({
+          error: "Upstream did not return a valid M3U8",
+          preview: text.slice(0, 200),
+        });
       }
 
       const rewritten = await rewriteM3u8(text, url, ref, origin);
 
       res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
       res.setHeader("Cache-Control", "no-cache, no-store");
-      console.log("[proxy] ✓ M3U8 served:", url.slice(0, 100));
+      console.log("[proxy] ✓ M3U8 served:", url.slice(0, 80));
       return res.status(200).send(rewritten);
     }
 
-    // ── Binary (video segments, key files, etc.) ──────────
+    // Binary response (video segments, keys etc.)
     const buffer = await upstream.arrayBuffer();
     const status = upstream.status === 206 ? 206 : 200;
 
@@ -326,12 +298,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   } catch (err: any) {
     clearTimeout(timer);
-
     if (err.name === "AbortError") {
-      console.error("[proxy] Timed out:", url.slice(0, 100));
+      console.error("[proxy] Timed out:", url.slice(0, 80));
       return res.status(504).json({ error: "Request timed out" });
     }
-
     console.error("[proxy] Error:", err.message);
     return res.status(500).json({ error: err.message });
   }
