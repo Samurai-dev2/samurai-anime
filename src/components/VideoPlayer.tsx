@@ -57,37 +57,30 @@ export default function VideoPlayer({
   intro,
   outro,
 }: VideoPlayerProps) {
-  const videoRef     = useRef<HTMLVideoElement>(null);
-  const plyrRef      = useRef<any>(null);
-  const hlsRef       = useRef<any>(null);
+  const videoRef    = useRef<HTMLVideoElement>(null);
+  const plyrRef     = useRef<any>(null);
+  const hlsRef      = useRef<any>(null);
 
-  const [error,       setError]       = useState<string | null>(null);
-  const [loading,     setLoading]     = useState(true);
-  const [retryCount,  setRetryCount]  = useState(0);
-  // Show skip intro button when inside the intro window
-  const [showSkipIntro, setShowSkipIntro] = useState(false);
-  const [showSkipOutro, setShowSkipOutro] = useState(false);
+  const [error,          setError]          = useState<string | null>(null);
+  const [loading,        setLoading]        = useState(true);
+  const [retryCount,     setRetryCount]     = useState(0);
+  const [showSkipIntro,  setShowSkipIntro]  = useState(false);
+  const [showSkipOutro,  setShowSkipOutro]  = useState(false);
 
   const destroyPlayer = useCallback(() => {
     if (plyrRef.current) { try { plyrRef.current.destroy(); } catch {} plyrRef.current = null; }
     if (hlsRef.current)  { try { hlsRef.current.destroy();  } catch {} hlsRef.current  = null; }
   }, []);
 
-  // ── Skip button logic ────────────────────────────────────────
-  // Watch the video currentTime and show skip buttons in the right windows
+  // ── Skip intro / outro detection ─────────────────────────────
   useEffect(() => {
     const video = videoRef.current;
     if (!video || (!intro && !outro)) return;
 
     function onTimeUpdate() {
       const t = video!.currentTime;
-
-      if (intro) {
-        setShowSkipIntro(t >= intro.start && t <= intro.end);
-      }
-      if (outro) {
-        setShowSkipOutro(t >= outro.start && t <= outro.end);
-      }
+      if (intro) setShowSkipIntro(t >= intro.start && t <= intro.end);
+      if (outro) setShowSkipOutro(t >= outro.start && t <= outro.end);
     }
 
     video.addEventListener("timeupdate", onTimeUpdate);
@@ -108,7 +101,7 @@ export default function VideoPlayer({
     }
   }, [outro]);
 
-  // ── Player init ──────────────────────────────────────────────
+  // ── Player init ───────────────────────────────────────────────
   useEffect(() => {
     if (!streamUrl) return;
 
@@ -147,4 +140,202 @@ export default function VideoPlayer({
             fragLoadingMaxRetry:     2,
           });
 
-          hlsRef.current = hls
+          hlsRef.current = hls;
+
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (cancelled) return;
+            console.log("[VideoPlayer] ✓ Manifest parsed");
+            setLoading(false);
+          });
+
+          hls.on(Hls.Events.ERROR, (_: any, data: any) => {
+            if (cancelled) return;
+            console.log(
+              "[VideoPlayer] HLS:", data.type, data.details,
+              "fatal:", data.fatal,
+              "url:", (data.url || "").slice(0, 80)
+            );
+            if (!data.fatal) return;
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              hls.startLoad();
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              hls.recoverMediaError();
+            } else {
+              setError("Stream failed to load. Please try again.");
+              setLoading(false);
+            }
+          });
+
+          hls.loadSource(absoluteUrl);
+          hls.attachMedia(video);
+
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          // Safari native HLS
+          video.src = absoluteUrl;
+          video.addEventListener(
+            "loadedmetadata",
+            () => { if (!cancelled) setLoading(false); },
+            { once: true }
+          );
+          video.addEventListener(
+            "error",
+            () => {
+              if (!cancelled) {
+                setError("Failed to load stream.");
+                setLoading(false);
+              }
+            },
+            { once: true }
+          );
+        } else {
+          setError("HLS is not supported in this browser.");
+          setLoading(false);
+          return;
+        }
+
+        // ── Plyr UI ──────────────────────────────────────────
+        const player = new Plyr(video, {
+          title:    title || "Anime",
+          controls: [
+            "play-large", "play", "rewind", "fast-forward",
+            "progress", "current-time", "duration",
+            "mute", "volume", "captions", "settings", "pip", "fullscreen",
+          ],
+          settings: ["captions", "quality", "speed"],
+          speed:    { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+          captions: { active: subtitles.length > 0, language: "en", update: true },
+          poster:   poster ?? undefined,
+          autoplay: false,
+        });
+
+        plyrRef.current = player;
+
+        // ── Quality switcher ─────────────────────────────────
+        if (hlsRef.current) {
+          const hls = hlsRef.current;
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (cancelled) return;
+            const levels: number[] = hls.levels.map((l: any) => l.height);
+            player.config.quality = {
+              default:  0,
+              options:  [0, ...levels],
+              forced:   true,
+              onChange(q: number) {
+                hls.currentLevel = q === 0
+                  ? -1
+                  : hls.levels.findIndex((l: any) => l.height === q);
+              },
+            };
+            player.quality = 0;
+          });
+        }
+
+      } catch (e: any) {
+        if (!cancelled) {
+          console.error("[VideoPlayer] Init error:", e.message);
+          setError(e?.message || "Failed to initialize player");
+          setLoading(false);
+        }
+      }
+    }
+
+    init();
+    return () => {
+      cancelled = true;
+      destroyPlayer();
+    };
+  }, [streamUrl, poster, title, referer, retryCount, destroyPlayer]);
+
+  return (
+    <div className="relative w-full rounded-2xl overflow-hidden ring-1 ring-white/10 shadow-2xl shadow-black/60 bg-black">
+
+      {/* Loading overlay */}
+      {loading && !error && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black z-20 aspect-video">
+          <div className="flex flex-col items-center gap-3">
+            <Loader2 className="w-10 h-10 text-red-500 animate-spin" />
+            <p className="text-gray-400 text-sm">Loading stream…</p>
+          </div>
+        </div>
+      )}
+
+      {/* Error overlay */}
+      {error && (
+        <div className="flex items-center justify-center bg-zinc-900 aspect-video">
+          <div className="text-center px-6 flex flex-col items-center gap-4">
+            <AlertTriangle className="w-10 h-10 text-yellow-400" />
+            <p className="text-white font-semibold">Stream Error</p>
+            <p className="text-gray-400 text-sm max-w-xs">{error}</p>
+            <button
+              onClick={() => setRetryCount((c) => c + 1)}
+              className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm rounded-lg transition-colors"
+            >
+              <RefreshCw className="w-4 h-4" /> Retry
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Skip Intro button */}
+      {showSkipIntro && !loading && !error && (
+        <div className="absolute bottom-20 right-4 z-30">
+          <button
+            onClick={skipIntro}
+            className="flex items-center gap-2 px-4 py-2 bg-black/80 hover:bg-black border border-white/20 hover:border-white/40 text-white text-sm font-semibold rounded-lg backdrop-blur-sm transition-all"
+          >
+            <SkipForward className="w-4 h-4" />
+            Skip Intro
+          </button>
+        </div>
+      )}
+
+      {/* Skip Outro button */}
+      {showSkipOutro && !loading && !error && (
+        <div className="absolute bottom-20 right-4 z-30">
+          <button
+            onClick={skipOutro}
+            className="flex items-center gap-2 px-4 py-2 bg-black/80 hover:bg-black border border-white/20 hover:border-white/40 text-white text-sm font-semibold rounded-lg backdrop-blur-sm transition-all"
+          >
+            <SkipForward className="w-4 h-4" />
+            Skip Outro
+          </button>
+        </div>
+      )}
+
+      {/* Video element */}
+      <div
+        className="aspect-video w-full"
+        style={{
+          "--plyr-color-main":         "#dc2626",
+          "--plyr-video-background":   "#000",
+          "--plyr-menu-background":    "#18181b",
+          "--plyr-menu-color":         "#fff",
+          "--plyr-menu-border-color":  "#27272a",
+          "--plyr-control-icon-size":  "18px",
+          "--plyr-font-size-base":     "14px",
+          "--plyr-tooltip-background": "#18181b",
+          "--plyr-tooltip-color":      "#fff",
+          "--plyr-badge-background":   "#dc2626",
+        } as React.CSSProperties}
+      >
+        <video
+          ref={videoRef}
+          className="w-full h-full"
+          crossOrigin="anonymous"
+          playsInline
+        >
+          {subtitles.map((sub) => (
+            <track
+              key={sub.lang}
+              kind="subtitles"
+              src={sub.url}
+              srcLang={sub.lang}
+              label={sub.label}
+              default={sub.lang === "en" || sub.lang === "English"}
+            />
+          ))}
+        </video>
+      </div>
+    </div>
+  );
+}
