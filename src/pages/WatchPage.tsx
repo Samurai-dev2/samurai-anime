@@ -77,7 +77,13 @@ function EpisodeList({
 }
 
 // ─── Sub / Dub Toggle ─────────────────────────────────────────
-function LangToggle({ lang, onChange }: { lang: Lang; onChange: (l: Lang) => void }) {
+function LangToggle({
+  lang,
+  onChange,
+}: {
+  lang: Lang;
+  onChange: (l: Lang) => void;
+}) {
   return (
     <div className="flex items-center rounded-lg overflow-hidden border border-white/10 text-xs font-semibold">
       <button
@@ -116,38 +122,6 @@ function LoadingScreen() {
   );
 }
 
-// ─── No Stream Screen ─────────────────────────────────────────
-function NoStreamScreen({ onBack }: { onBack: () => void }) {
-  const navigate = useNavigate();
-  return (
-    <div className="bg-black min-h-screen flex items-center justify-center px-4">
-      <div className="max-w-md text-center">
-        <div className="w-16 h-16 bg-yellow-500/10 rounded-full flex items-center justify-center mx-auto mb-4">
-          <AlertTriangle className="w-8 h-8 text-yellow-400" />
-        </div>
-        <h2 className="text-2xl font-bold text-white mb-2">No Stream Available</h2>
-        <p className="text-gray-400 text-sm mb-6 leading-relaxed">
-          We couldn't find a stream for this title right now. Please try again later.
-        </p>
-        <div className="flex gap-3 justify-center">
-          <button
-            onClick={onBack}
-            className="flex items-center gap-2 px-5 py-2.5 bg-white/5 hover:bg-white/10 border border-white/10 text-white rounded-xl transition-colors"
-          >
-            <ArrowLeft className="w-4 h-4" /> Go Back
-          </button>
-          <button
-            onClick={() => navigate("/library")}
-            className="flex items-center gap-2 px-5 py-2.5 bg-red-600 hover:bg-red-500 text-white rounded-xl transition-colors"
-          >
-            Browse Library
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // ─── Main WatchPage ───────────────────────────────────────────
 export default function WatchPage() {
   const { malId }                       = useParams<{ malId: string }>();
@@ -161,8 +135,8 @@ export default function WatchPage() {
     localAnime ? null : id,
   );
 
-  const mapping      = getAnimeMapping(id);
-  const movie        = mapping?.type?.toLowerCase() === "movie";
+  const mapping = getAnimeMapping(id);
+  const movie   = mapping?.type?.toLowerCase() === "movie";
 
   const title =
     localAnime?.englishTitle  ||
@@ -180,27 +154,24 @@ export default function WatchPage() {
   // ── State ──────────────────────────────────────────────────
   const mappedSeason = mapping?.season ?? 1;
 
-  const [season,        setSeason]     = useState(parseInt(searchParams.get("season")  || String(mappedSeason)));
-  const [episode,       setEpisode]    = useState(parseInt(searchParams.get("episode") || "1"));
-  const [lang,          setLang]       = useState<Lang>((searchParams.get("lang") as Lang) || "sub");
-  const [showEpList,    setShowEpList] = useState(true);
-  const [reloadKey,     setReloadKey]  = useState(0);
+  const [season,     setSeason]     = useState(parseInt(searchParams.get("season")  || String(mappedSeason)));
+  const [episode,    setEpisode]    = useState(parseInt(searchParams.get("episode") || "1"));
+  const [lang,       setLang]       = useState<Lang>((searchParams.get("lang") as Lang) || "sub");
+  const [showEpList, setShowEpList] = useState(true);
+  const [reloadKey,  setReloadKey]  = useState(0);
 
   // ── Stream ─────────────────────────────────────────────────
-const {
-  streamUrl,
-  subtitles,
-  streamHeaders,
-  loading:     streamLoading,
-  error:       streamError,
-  sourceLabel,
-} = useStreamUrl(
-  title,
-  episode,
-  lang,
-  id,
-  season,   // ← add this
-);
+  const {
+    streamUrl,
+    subtitles,
+    streamHeaders,
+    loading:   streamLoading,
+    error:     streamError,
+    sourceLabel,
+    intro,
+    outro,
+  } = useStreamUrl(title, episode, lang, id, season);
+
   // ── Sync URL + save progress ───────────────────────────────
   useEffect(() => {
     if (!id) return;
@@ -224,17 +195,17 @@ const {
   }, []);
 
   const prevEp = useCallback(() => {
-    if (episode > 1)        setEpisode((e) => e - 1);
+    if (episode > 1)      setEpisode((e) => e - 1);
     else if (season > 1) { setSeason((s) => s - 1); setEpisode(1); }
   }, [episode, season]);
 
   const nextEp = useCallback(() => {
-    if (episode < totalEpisodes)         setEpisode((e) => e + 1);
+    if (episode < totalEpisodes)          setEpisode((e) => e + 1);
     else if (season < totalSeasons) { setSeason((s) => s + 1); setEpisode(1); }
   }, [episode, totalEpisodes, season, totalSeasons]);
 
-  const selectEp     = useCallback((ep: number) => setEpisode(ep),     []);
-  const selectSeason = useCallback((s: number)  => { setSeason(s); setEpisode(1); }, []);
+  const selectEp     = useCallback((ep: number) => setEpisode(ep), []);
+  const selectSeason = useCallback((s: number) => { setSeason(s); setEpisode(1); }, []);
 
   // ── Guards ─────────────────────────────────────────────────
   if (!id || isNaN(id)) {
@@ -281,7 +252,6 @@ const {
             </span>
           </div>
 
-          {/* lang badge */}
           <span className={`flex-shrink-0 px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-widest ${
             lang === "dub"
               ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
@@ -290,7 +260,6 @@ const {
             {lang === "dub" ? "🎙 EN Dub" : "🎌 JP Sub"}
           </span>
 
-          {/* ad-free badge — always on now */}
           <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border bg-green-500/10 border-green-500/20 text-green-400">
             ✨ Ad-Free
           </div>
@@ -319,10 +288,11 @@ const {
                 poster={coverImage}
                 title={movie ? title : `${title} S${season}E${episode}`}
                 referer={streamHeaders?.referer}
+                intro={intro}
+                outro={outro}
               />
 
             ) : (
-              // Nothing found
               <div className="aspect-video w-full bg-zinc-900/80 rounded-2xl ring-1 ring-white/10 flex items-center justify-center">
                 <div className="text-center px-6">
                   <AlertTriangle className="w-10 h-10 text-yellow-400 mx-auto mb-3" />
@@ -342,8 +312,6 @@ const {
 
             {/* ── Controls ── */}
             <div className="mt-4 flex flex-wrap items-center gap-3">
-
-              {/* prev / next */}
               {!movie && (
                 <div className="flex gap-2">
                   <button
@@ -363,10 +331,8 @@ const {
                 </div>
               )}
 
-              {/* sub / dub */}
               <LangToggle lang={lang} onChange={handleLangChange} />
 
-              {/* utility */}
               <div className="ml-auto flex gap-2">
                 <button
                   onClick={reload}
@@ -395,6 +361,22 @@ const {
                   Not all anime have an English dub. If Japanese audio plays,
                   a dub doesn't exist for this title yet.
                 </p>
+              </div>
+            )}
+
+            {/* intro / outro timestamps */}
+            {(intro || outro) && (
+              <div className="mt-3 flex gap-2 flex-wrap">
+                {intro && (
+                  <div className="flex items-center gap-1.5 px-3 py-1.5 bg-yellow-500/10 border border-yellow-500/20 rounded-lg text-xs text-yellow-400">
+                    ⏭ Intro: {intro.start}s – {intro.end}s
+                  </div>
+                )}
+                {outro && (
+                  <div className="flex items-center gap-1.5 px-3 py-1.5 bg-purple-500/10 border border-purple-500/20 rounded-lg text-xs text-purple-400">
+                    ⏭ Outro: {outro.start}s – {outro.end}s
+                  </div>
+                )}
               </div>
             )}
 
@@ -449,7 +431,6 @@ const {
                   {movie ? "Movie" : `S${season} · E${episode} of ${totalEpisodes}`}
                 </p>
 
-                {/* badges */}
                 <div className="inline-flex items-center gap-1 mt-1.5 px-2 py-0.5 rounded-full text-xs font-semibold border bg-green-500/15 text-green-400 border-green-500/20">
                   ✨ Ad-Free
                 </div>
