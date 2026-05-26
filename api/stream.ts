@@ -66,7 +66,7 @@ interface MiruroWatchResponse {
 
 // ─── Config ───────────────────────────────────────────────────
 
-const MIRURO_API = "https://miruro-native-api.vercel.app";
+const MIRURO_API = "https://api-test-blush-one.vercel.app";
 
 // Providers in preference order
 // kiwi = AnimePahe (best quality, no ads)
