@@ -318,12 +318,11 @@ export default function VideoPlayer({
           "--plyr-badge-background":   "#dc2626",
         } as React.CSSProperties}
       >
-        <video
-          ref={videoRef}
-          className="w-full h-full"
-          crossOrigin="anonymous"
-          playsInline
-        >
+      <video
+  ref={videoRef}
+  className="w-full h-full"
+  playsInline
+>
           {subtitles.map((sub) => (
             <track
               key={sub.lang}
