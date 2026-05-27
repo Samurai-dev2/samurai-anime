@@ -1,5 +1,14 @@
 // api/stream.ts
 import type { VercelRequest, VercelResponse } from "@vercel/node";
+// Import the mapper JSON directly
+import animeSeasons from "../src/data/anime-seasons.json";
+
+interface AnimeMapping {
+  mal_id:      number;
+  anilist_id:  number;
+  type?:       string;
+  season?:     { tvdb?: number; tmdb?: number };
+}
 
 interface StreamResponse {
   url:       string | null;
@@ -62,16 +71,6 @@ interface MiruroWatchResponse {
   outro:     { start: number; end: number } | null;
 }
 
-interface MiruroSearchResult {
-  id:    number;
-  title: { romaji: string; english: string | null; native: string };
-  idMal: number | null;
-}
-
-interface MiruroSearchResponse {
-  results: MiruroSearchResult[];
-}
-
 interface ProxifyResponse {
   proxifiedSource: {
     miruro?:     string;
@@ -83,9 +82,30 @@ interface ProxifyResponse {
 
 // ── Config ────────────────────────────────────────────────────
 const MIRURO_API     = "https://api-test-blush-one.vercel.app";
-const PROXIFY_API    = "https://web-production-3a1a9.up.railway.app/";
+const PROXIFY_API    = "https://web-production-3a1a9.up.railway.app";
 const PROVIDER_ORDER = ["kiwi", "arc", "zoro", "jet"];
 const TIMEOUT_MS     = 25_000;
+
+// ── Build a MAL→AniList lookup map at startup ─────────────────
+// This runs once when the function cold-starts — very fast
+const malToAnilist = new Map<number, number>();
+for (const entry of animeSeasons as AnimeMapping[]) {
+  if (entry.mal_id && entry.anilist_id) {
+    malToAnilist.set(entry.mal_id, entry.anilist_id);
+  }
+}
+console.log(`[stream] Mapper loaded: ${malToAnilist.size} entries`);
+
+// ── Convert MAL ID → AniList ID ───────────────────────────────
+function malIdToAnilistId(malId: number): number | null {
+  const anilistId = malToAnilist.get(malId);
+  if (anilistId) {
+    console.log(`[stream] Mapper: MAL ${malId} → AniList ${anilistId}`);
+    return anilistId;
+  }
+  console.warn(`[stream] Mapper: no entry for MAL ${malId}`);
+  return null;
+}
 
 // ── Helpers ───────────────────────────────────────────────────
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -143,17 +163,12 @@ async function getProxifiedUrl(
 
     const json = await res.json() as ProxifyResponse;
     const src  = json?.proxifiedSource;
+    if (!src) return null;
 
-    if (!src) {
-      console.warn("[proxify] No proxifiedSource in response");
-      return null;
-    }
-
-    // Try providers in order of reliability
-    // lunaranime is simplest (just URL encode) — most compatible
-    // miruro uses XOR encryption — very reliable
-    // anikuro uses base64 — good fallback
-    // animanga uses JSON headers — last resort
+    // lunaranime = simplest encoding, most compatible
+    // miruro     = XOR encrypted, very reliable
+    // anikuro    = base64
+    // animanga   = JSON headers
     const picked =
       src.lunaranime ||
       src.miruro     ||
@@ -162,96 +177,15 @@ async function getProxifiedUrl(
       null;
 
     if (picked) {
-      console.log("[proxify] ✓ Picked URL:", picked.slice(0, 100));
+      console.log("[proxify] ✓ URL:", picked.slice(0, 100));
     } else {
-      console.warn("[proxify] All providers returned empty");
+      console.warn("[proxify] All providers empty");
     }
-
     return picked;
   } catch (err: any) {
     console.error("[proxify] Failed:", err.message);
     return null;
   }
-}
-
-// ── MAL ID → AniList ID ───────────────────────────────────────
-async function resolveAnilistId(
-  malId: number,
-  title?: string
-): Promise<number | null> {
-  console.log(`[stream] Resolving AniList ID — MAL:${malId} title:"${title ?? ""}"`);
-
-  // Method 1: AniList GraphQL (most accurate)
-  try {
-    const query = `
-      query ($malId: Int) {
-        Media(idMal: $malId, type: ANIME) {
-          id
-          title { romaji english }
-        }
-      }
-    `;
-    const res = await withTimeout(
-      fetch("https://graphql.anilist.co", {
-        method:  "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept":       "application/json",
-        },
-        body: JSON.stringify({ query, variables: { malId } }),
-      }),
-      10_000
-    );
-
-    if (res.ok) {
-      const data = await res.json();
-      const id   = data?.data?.Media?.id;
-      if (id) {
-        const t = data?.data?.Media?.title?.english
-               ?? data?.data?.Media?.title?.romaji;
-        console.log(`[stream] GraphQL ✓ MAL ${malId} → AniList ${id} "${t}"`);
-        return id;
-      }
-      console.warn("[stream] GraphQL: no ID in response", JSON.stringify(data?.errors));
-    } else {
-      console.warn("[stream] GraphQL HTTP:", res.status);
-    }
-  } catch (err: any) {
-    console.warn("[stream] GraphQL threw:", err.message);
-  }
-
-  // Method 2: Search Miruro by title and match MAL ID
-  if (title) {
-    try {
-      const url  = `${MIRURO_API}/search?query=${encodeURIComponent(title)}&per_page=10`;
-      const data = await fetchJson<MiruroSearchResponse>(url, "title-search");
-
-      if (data?.results?.length) {
-        console.log(
-          "[stream] Search results:",
-          data.results.slice(0, 3)
-            .map((r) => `"${r.title.english ?? r.title.romaji}"(AL:${r.id} MAL:${r.idMal})`)
-            .join(" | ")
-        );
-
-        // Prefer exact MAL ID match
-        const exact = data.results.find((r) => r.idMal === malId);
-        if (exact) {
-          console.log(`[stream] Search ✓ MAL ${malId} → AniList ${exact.id}`);
-          return exact.id;
-        }
-
-        // Use first result as fallback
-        console.log(`[stream] Search fallback → AniList ${data.results[0].id}`);
-        return data.results[0].id;
-      }
-    } catch (err: any) {
-      console.warn("[stream] Title search threw:", err.message);
-    }
-  }
-
-  console.error(`[stream] ✗ Could not resolve AniList ID for MAL ${malId}`);
-  return null;
 }
 
 // ── Main stream resolver ──────────────────────────────────────
@@ -261,7 +195,7 @@ async function resolveStream(
   lang:      "sub" | "dub"
 ): Promise<StreamResponse | null> {
 
-  // Step 1: Get episode list
+  // Step 1: Get episodes from Miruro
   let episodesData: MiruroEpisodesResponse;
   try {
     episodesData = await fetchJson<MiruroEpisodesResponse>(
@@ -274,19 +208,18 @@ async function resolveStream(
   }
 
   if (!episodesData?.providers) {
-    console.log("[stream] No providers:", JSON.stringify(episodesData).slice(0, 200));
+    console.log("[stream] No providers in response");
     return null;
   }
 
   const allProviders = Object.keys(episodesData.providers);
   console.log("[stream] Providers:", allProviders.join(", "));
 
-  // Step 2: Find the episode ID
+  // Step 2: Find episode ID
   let episodeId: string | null = null;
   let provider:  string | null = null;
   let usedLang   = lang;
 
-  // Deduplicate provider order (preferred first, then any remaining)
   const orderedProviders = [
     ...PROVIDER_ORDER,
     ...allProviders.filter((p) => !PROVIDER_ORDER.includes(p)),
@@ -316,21 +249,19 @@ async function resolveStream(
   }
 
   if (!episodeId || !provider) {
-    // Log available episode numbers to help debug
     for (const prov of allProviders.slice(0, 3)) {
       const sub = episodesData.providers[prov]?.episodes?.sub;
-      const dub = episodesData.providers[prov]?.episodes?.dub;
       console.log(
-        `[stream] "${prov}" sub:${sub?.length ?? 0} dub:${dub?.length ?? 0}`,
-        sub?.slice(0, 5).map((e) => e.number).join(",") ?? ""
+        `[stream] "${prov}" has ${sub?.length ?? 0} sub eps:`,
+        sub?.slice(0, 5).map((e) => e.number).join(", ") ?? "none"
       );
     }
     console.log(`[stream] E${episode} not found in any provider`);
     return null;
   }
 
-  // Step 3: Get stream URL
-  // episodeId format: "watch/kiwi/178005/sub/animepahe-1"
+  // Step 3: Get watch data
+  // episodeId = "watch/kiwi/178005/sub/animepahe-1"
   const watchUrl = `${MIRURO_API}/${episodeId}`;
   console.log("[stream] Watch URL:", watchUrl);
 
@@ -343,7 +274,7 @@ async function resolveStream(
   }
 
   if (!watchData?.streams?.length) {
-    console.log("[stream] No streams:", JSON.stringify(watchData).slice(0, 300));
+    console.log("[stream] No streams:", JSON.stringify(watchData).slice(0, 200));
     return null;
   }
 
@@ -363,13 +294,13 @@ async function resolveStream(
     return null;
   }
 
-  console.log("[stream] Raw stream URL:", stream.url.slice(0, 100));
+  console.log("[stream] Raw URL:", stream.url.slice(0, 100));
 
-  // Determine the correct referer for this CDN
+  // Determine correct referer for this CDN
   let referer = "https://kwik.cx/";
   try {
     const hostname = new URL(stream.url).hostname;
-    console.log("[stream] CDN hostname:", hostname);
+    console.log("[stream] CDN:", hostname);
     if (hostname.includes("rapid-cloud") || hostname.includes("megacloud")) {
       referer = "https://zoro.to/";
     } else if (hostname.includes("gogocdn") || hostname.includes("gogoanime")) {
@@ -377,7 +308,7 @@ async function resolveStream(
     }
   } catch {}
 
-  // Step 4: Get proxified URL from Proxify API
+  // Step 4: Proxify the stream URL
   const proxifiedUrl = await getProxifiedUrl(stream.url, referer);
 
   const subtitles: SubtitleTrack[] = (watchData.subtitles ?? [])
@@ -392,21 +323,21 @@ async function resolveStream(
     return {
       url:       proxifiedUrl,
       subtitles,
-      intro:     watchData.intro ?? null,
-      outro:     watchData.outro ?? null,
+      intro:     watchData.intro  ?? null,
+      outro:     watchData.outro  ?? null,
       source:    `Miruro · ${provider} · ${stream.quality} · ${usedLang}`,
       referer,
       headers:   {},
     };
   }
 
-  // Fallback: use our own proxy
-  console.warn("[stream] Proxify failed — using own proxy as fallback");
+  // Fallback: our own proxy
+  console.warn("[stream] Proxify failed — using own proxy");
   return {
     url: `/api/proxy?url=${encodeURIComponent(stream.url)}&referer=${encodeURIComponent(referer)}`,
     subtitles,
-    intro:   watchData.intro ?? null,
-    outro:   watchData.outro ?? null,
+    intro:   watchData.intro  ?? null,
+    outro:   watchData.outro  ?? null,
     source:  `Miruro · ${provider} · ${stream.quality} · ${usedLang} (fallback)`,
     referer,
     headers: {},
@@ -423,7 +354,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== "GET")
     return res.status(405).json({ error: "Method not allowed" });
 
-  const { episode, lang, malId, title } = req.query;
+  const { episode, lang, malId } = req.query;
 
   if (!malId || typeof malId !== "string")
     return res.status(400).json({ error: "malId is required" });
@@ -432,22 +363,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (isNaN(malIdNum))
     return res.status(400).json({ error: "malId must be a number" });
 
-  const ep       = Math.max(1, parseInt(String(episode || "1")) || 1);
-  const audio    = (lang === "dub" ? "dub" : "sub") as "sub" | "dub";
-  const titleStr = typeof title === "string" ? title : undefined;
+  const ep    = Math.max(1, parseInt(String(episode || "1")) || 1);
+  const audio = (lang === "dub" ? "dub" : "sub") as "sub" | "dub";
 
-  console.log(`\n══ [stream] MAL:${malIdNum} "${titleStr}" E${ep} [${audio}] ══`);
+  console.log(`\n══ [stream] MAL:${malIdNum} E${ep} [${audio}] ══`);
 
   try {
-    const anilistId = await resolveAnilistId(malIdNum, titleStr);
+    // Use local mapper — no external API call needed
+    const anilistId = malIdToAnilistId(malIdNum);
 
     if (!anilistId) {
       return res.status(200).json({
         url: null, subtitles: [], intro: null, outro: null,
         source: null,
-        error: `Could not find AniList ID for MAL ID ${malIdNum}`,
+        error: `MAL ID ${malIdNum} not found in mapper. The anime may not be in our database.`,
       });
     }
+
+    console.log(`[stream] AniList ID: ${anilistId}`);
 
     const result = await resolveStream(anilistId, ep, audio);
 
@@ -458,11 +391,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     return res.status(200).json({
       url: null, subtitles: [], intro: null, outro: null,
-      source: null, error: "No stream found",
+      source: null, error: "No stream found for this episode",
     });
 
   } catch (err: any) {
-    console.error("[stream] Unhandled error:", err.message);
+    console.error("[stream] Error:", err.message);
     return res.status(500).json({
       url: null, subtitles: [], intro: null, outro: null,
       source: null, error: "Internal server error",
