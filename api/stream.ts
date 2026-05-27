@@ -82,9 +82,10 @@ interface ProxifyResponse {
 }
 
 // ── Config ────────────────────────────────────────────────────
-const MIRURO_API   = "https://api-test-blush-one.vercel.app";
+const MIRURO_API     = "https://api-test-blush-one.vercel.app";
+const PROXIFY_API    = "https://web-production-3a1a9.up.railway.app/";
 const PROVIDER_ORDER = ["kiwi", "arc", "zoro", "jet"];
-const TIMEOUT_MS   = 25_000;
+const TIMEOUT_MS     = 25_000;
 
 // ── Helpers ───────────────────────────────────────────────────
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -114,22 +115,19 @@ async function fetchJson<T>(url: string, label = ""): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-// ── Get proxified URL from Proxify API ────────────────────────
-// This replaces our entire proxy.ts logic for M3U8 streams
-async function proxifyUrl(
+// ── Call Proxify API ──────────────────────────────────────────
+async function getProxifiedUrl(
   streamUrl: string,
-  referer:   string,
-  proxifyBase: string
+  referer:   string
 ): Promise<string | null> {
   try {
-    // Format: /proxy?data={url}|{referer}
-    const data      = `${streamUrl}|${referer}`;
-    const proxyUrl  = `${proxifyBase}/proxy?data=${encodeURIComponent(data)}`;
+    const data     = `${streamUrl}|${referer}`;
+    const endpoint = `${PROXIFY_API}/proxy?data=${encodeURIComponent(data)}`;
 
-    console.log("[proxify] Requesting:", proxyUrl.slice(0, 120));
+    console.log("[proxify] Calling:", endpoint.slice(0, 120));
 
     const res = await withTimeout(
-      fetch(proxyUrl, {
+      fetch(endpoint, {
         headers: {
           "User-Agent": "Mozilla/5.0 (compatible; SamuraiAnime/1.0)",
           "Accept":     "application/json",
@@ -139,36 +137,37 @@ async function proxifyUrl(
     );
 
     if (!res.ok) {
-      console.warn("[proxify] API returned:", res.status);
+      console.warn("[proxify] HTTP error:", res.status);
       return null;
     }
 
-    const data2 = await res.json() as ProxifyResponse;
+    const json = await res.json() as ProxifyResponse;
+    const src  = json?.proxifiedSource;
 
-    console.log(
-      "[proxify] Response:",
-      JSON.stringify(data2?.proxifiedSource ?? {})
-    );
-
-    // Try providers in order — use first working URL
-    const source = data2?.proxifiedSource;
-    if (!source) return null;
-
-    // Miruro proxy is most reliable for AnimePahe streams
-    const url =
-      source.miruro     ||
-      source.anikuro    ||
-      source.lunaranime ||
-      source.animanga   ||
-      null;
-
-    if (url) {
-      console.log("[proxify] ✓ Got proxified URL:", url.slice(0, 80));
-    } else {
-      console.warn("[proxify] No valid URL in response");
+    if (!src) {
+      console.warn("[proxify] No proxifiedSource in response");
+      return null;
     }
 
-    return url;
+    // Try providers in order of reliability
+    // lunaranime is simplest (just URL encode) — most compatible
+    // miruro uses XOR encryption — very reliable
+    // anikuro uses base64 — good fallback
+    // animanga uses JSON headers — last resort
+    const picked =
+      src.lunaranime ||
+      src.miruro     ||
+      src.anikuro    ||
+      src.animanga   ||
+      null;
+
+    if (picked) {
+      console.log("[proxify] ✓ Picked URL:", picked.slice(0, 100));
+    } else {
+      console.warn("[proxify] All providers returned empty");
+    }
+
+    return picked;
   } catch (err: any) {
     console.error("[proxify] Failed:", err.message);
     return null;
@@ -180,9 +179,9 @@ async function resolveAnilistId(
   malId: number,
   title?: string
 ): Promise<number | null> {
-  console.log(`[stream] Resolving AniList ID for MAL ${malId}`);
+  console.log(`[stream] Resolving AniList ID — MAL:${malId} title:"${title ?? ""}"`);
 
-  // Method 1: AniList GraphQL
+  // Method 1: AniList GraphQL (most accurate)
   try {
     const query = `
       query ($malId: Int) {
@@ -208,63 +207,61 @@ async function resolveAnilistId(
       const data = await res.json();
       const id   = data?.data?.Media?.id;
       if (id) {
-        const t = data?.data?.Media?.title?.english ?? data?.data?.Media?.title?.romaji;
-        console.log(`[stream] GraphQL: MAL ${malId} → AniList ${id} "${t}"`);
+        const t = data?.data?.Media?.title?.english
+               ?? data?.data?.Media?.title?.romaji;
+        console.log(`[stream] GraphQL ✓ MAL ${malId} → AniList ${id} "${t}"`);
         return id;
       }
-      if (data?.errors) {
-        console.warn("[stream] GraphQL errors:", JSON.stringify(data.errors));
-      }
+      console.warn("[stream] GraphQL: no ID in response", JSON.stringify(data?.errors));
     } else {
       console.warn("[stream] GraphQL HTTP:", res.status);
     }
   } catch (err: any) {
-    console.warn("[stream] GraphQL failed:", err.message);
+    console.warn("[stream] GraphQL threw:", err.message);
   }
 
-  // Method 2: Miruro search by title
+  // Method 2: Search Miruro by title and match MAL ID
   if (title) {
     try {
       const url  = `${MIRURO_API}/search?query=${encodeURIComponent(title)}&per_page=10`;
-      const data = await fetchJson<MiruroSearchResponse>(url, "search");
+      const data = await fetchJson<MiruroSearchResponse>(url, "title-search");
 
       if (data?.results?.length) {
         console.log(
           "[stream] Search results:",
-          data.results.slice(0, 3).map((r) =>
-            `"${r.title.english ?? r.title.romaji}"(AL:${r.id} MAL:${r.idMal})`
-          ).join(" | ")
+          data.results.slice(0, 3)
+            .map((r) => `"${r.title.english ?? r.title.romaji}"(AL:${r.id} MAL:${r.idMal})`)
+            .join(" | ")
         );
 
         // Prefer exact MAL ID match
-        const byMal = data.results.find((r) => r.idMal === malId);
-        if (byMal) {
-          console.log(`[stream] Search: MAL ${malId} → AniList ${byMal.id}`);
-          return byMal.id;
+        const exact = data.results.find((r) => r.idMal === malId);
+        if (exact) {
+          console.log(`[stream] Search ✓ MAL ${malId} → AniList ${exact.id}`);
+          return exact.id;
         }
 
-        // Fall back to first result
+        // Use first result as fallback
         console.log(`[stream] Search fallback → AniList ${data.results[0].id}`);
         return data.results[0].id;
       }
     } catch (err: any) {
-      console.warn("[stream] Search fallback failed:", err.message);
+      console.warn("[stream] Title search threw:", err.message);
     }
   }
 
-  console.error(`[stream] Could not resolve AniList ID for MAL ${malId}`);
+  console.error(`[stream] ✗ Could not resolve AniList ID for MAL ${malId}`);
   return null;
 }
 
-// ── Main streaming function ───────────────────────────────────
-async function streamFromMiruro(
-  anilistId:   number,
-  episode:     number,
-  lang:        "sub" | "dub",
-  proxifyBase: string
+// ── Main stream resolver ──────────────────────────────────────
+async function resolveStream(
+  anilistId: number,
+  episode:   number,
+  lang:      "sub" | "dub"
 ): Promise<StreamResponse | null> {
 
-  // Step 1: Get episodes
+  // Step 1: Get episode list
   let episodesData: MiruroEpisodesResponse;
   try {
     episodesData = await fetchJson<MiruroEpisodesResponse>(
@@ -281,23 +278,29 @@ async function streamFromMiruro(
     return null;
   }
 
-  const availableProviders = Object.keys(episodesData.providers);
-  console.log("[stream] Providers:", availableProviders.join(", "));
+  const allProviders = Object.keys(episodesData.providers);
+  console.log("[stream] Providers:", allProviders.join(", "));
 
-  // Step 2: Find episode ID
+  // Step 2: Find the episode ID
   let episodeId: string | null = null;
   let provider:  string | null = null;
   let usedLang   = lang;
 
-  // Try preferred providers first
-  for (const prov of [...PROVIDER_ORDER, ...availableProviders]) {
+  // Deduplicate provider order (preferred first, then any remaining)
+  const orderedProviders = [
+    ...PROVIDER_ORDER,
+    ...allProviders.filter((p) => !PROVIDER_ORDER.includes(p)),
+  ];
+
+  for (const prov of orderedProviders) {
     const provData = episodesData.providers[prov];
     if (!provData?.episodes) continue;
 
-    const langsToTry = lang === "sub" ? ["sub", "dub"] : ["dub", "sub"];
+    const langsToTry: ("sub" | "dub")[] =
+      lang === "sub" ? ["sub", "dub"] : ["dub", "sub"];
 
     for (const tryLang of langsToTry) {
-      const eps = provData.episodes[tryLang as "sub" | "dub"];
+      const eps = provData.episodes[tryLang];
       if (!Array.isArray(eps) || !eps.length) continue;
 
       const ep = eps.find((e) => e.number === episode);
@@ -305,7 +308,7 @@ async function streamFromMiruro(
         episodeId = ep.id;
         provider  = prov;
         usedLang  = tryLang;
-        console.log(`[stream] E${episode} in "${prov}" [${tryLang}]: ${ep.id}`);
+        console.log(`[stream] ✓ E${episode} in "${prov}"[${tryLang}]: ${ep.id}`);
         break;
       }
     }
@@ -313,22 +316,21 @@ async function streamFromMiruro(
   }
 
   if (!episodeId || !provider) {
-    // Log available episodes for debugging
-    for (const prov of availableProviders.slice(0, 2)) {
+    // Log available episode numbers to help debug
+    for (const prov of allProviders.slice(0, 3)) {
       const sub = episodesData.providers[prov]?.episodes?.sub;
-      if (sub?.length) {
-        console.log(
-          `"${prov}" episodes:`,
-          sub.slice(0, 10).map((e) => e.number).join(", ")
-        );
-      }
+      const dub = episodesData.providers[prov]?.episodes?.dub;
+      console.log(
+        `[stream] "${prov}" sub:${sub?.length ?? 0} dub:${dub?.length ?? 0}`,
+        sub?.slice(0, 5).map((e) => e.number).join(",") ?? ""
+      );
     }
-    console.log(`[stream] E${episode} not found`);
+    console.log(`[stream] E${episode} not found in any provider`);
     return null;
   }
 
-  // Step 3: Get watch data
-  // episodeId = "watch/kiwi/178005/sub/animepahe-1"
+  // Step 3: Get stream URL
+  // episodeId format: "watch/kiwi/178005/sub/animepahe-1"
   const watchUrl = `${MIRURO_API}/${episodeId}`;
   console.log("[stream] Watch URL:", watchUrl);
 
@@ -341,7 +343,7 @@ async function streamFromMiruro(
   }
 
   if (!watchData?.streams?.length) {
-    console.log("[stream] No streams:", JSON.stringify(watchData).slice(0, 200));
+    console.log("[stream] No streams:", JSON.stringify(watchData).slice(0, 300));
     return null;
   }
 
@@ -357,64 +359,58 @@ async function streamFromMiruro(
 
   const stream = hlsStreams[0] ?? watchData.streams.find((s) => s.url);
   if (!stream?.url) {
-    console.log("[stream] No valid stream URL");
+    console.log("[stream] No usable stream URL");
     return null;
   }
 
   console.log("[stream] Raw stream URL:", stream.url.slice(0, 100));
 
-  // Determine referer for this CDN
+  // Determine the correct referer for this CDN
   let referer = "https://kwik.cx/";
   try {
-    const h = new URL(stream.url).hostname;
-    if (h.includes("rapid-cloud") || h.includes("megacloud")) {
+    const hostname = new URL(stream.url).hostname;
+    console.log("[stream] CDN hostname:", hostname);
+    if (hostname.includes("rapid-cloud") || hostname.includes("megacloud")) {
       referer = "https://zoro.to/";
-    } else if (h.includes("gogocdn")) {
+    } else if (hostname.includes("gogocdn") || hostname.includes("gogoanime")) {
       referer = "https://gogoanime.tel/";
     }
   } catch {}
 
   // Step 4: Get proxified URL from Proxify API
-  const proxifiedUrl = await proxifyUrl(stream.url, referer, proxifyBase);
+  const proxifiedUrl = await getProxifiedUrl(stream.url, referer);
 
-  if (!proxifiedUrl) {
-    console.warn("[stream] Proxify failed — falling back to our own proxy");
-    // Fall back to our own proxy
-    const fallbackUrl =
-      `/api/proxy` +
-      `?url=${encodeURIComponent(stream.url)}` +
-      `&referer=${encodeURIComponent(referer)}`;
-
-    return {
-      url:       fallbackUrl,
-      subtitles: buildSubtitles(watchData),
-      intro:     watchData.intro ?? null,
-      outro:     watchData.outro ?? null,
-      source:    `Miruro · ${provider} · ${stream.quality} · ${usedLang} (own proxy)`,
-      referer,
-      headers:   {},
-    };
-  }
-
-  return {
-    url:       proxifiedUrl,  // ← Direct URL, no proxy needed
-    subtitles: buildSubtitles(watchData),
-    intro:     watchData.intro ?? null,
-    outro:     watchData.outro ?? null,
-    source:    `Miruro · ${provider} · ${stream.quality} · ${usedLang}`,
-    referer,
-    headers:   {},
-  };
-}
-
-function buildSubtitles(watchData: MiruroWatchResponse): SubtitleTrack[] {
-  return (watchData.subtitles ?? [])
+  const subtitles: SubtitleTrack[] = (watchData.subtitles ?? [])
     .filter((s) => s.file && s.label)
     .map((s) => ({
       url:   s.file,
       lang:  s.label.toLowerCase().slice(0, 2),
       label: s.label,
     }));
+
+  if (proxifiedUrl) {
+    return {
+      url:       proxifiedUrl,
+      subtitles,
+      intro:     watchData.intro ?? null,
+      outro:     watchData.outro ?? null,
+      source:    `Miruro · ${provider} · ${stream.quality} · ${usedLang}`,
+      referer,
+      headers:   {},
+    };
+  }
+
+  // Fallback: use our own proxy
+  console.warn("[stream] Proxify failed — using own proxy as fallback");
+  return {
+    url: `/api/proxy?url=${encodeURIComponent(stream.url)}&referer=${encodeURIComponent(referer)}`,
+    subtitles,
+    intro:   watchData.intro ?? null,
+    outro:   watchData.outro ?? null,
+    source:  `Miruro · ${provider} · ${stream.quality} · ${usedLang} (fallback)`,
+    referer,
+    headers: {},
+  };
 }
 
 // ── Handler ───────────────────────────────────────────────────
@@ -440,15 +436,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const audio    = (lang === "dub" ? "dub" : "sub") as "sub" | "dub";
   const titleStr = typeof title === "string" ? title : undefined;
 
-  // Get the Proxify API base URL from environment variable
-  // Set PROXIFY_API_URL in your Vercel environment variables
-  // pointing to wherever you deployed the Proxify Flask app
-  const proxifyBase =
-    process.env.PROXIFY_API_URL ||
-    "https://your-proxify-deployment.vercel.app"; // ← replace this
-
   console.log(`\n══ [stream] MAL:${malIdNum} "${titleStr}" E${ep} [${audio}] ══`);
-  console.log(`[stream] Using Proxify: ${proxifyBase}`);
 
   try {
     const anilistId = await resolveAnilistId(malIdNum, titleStr);
@@ -461,9 +449,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       });
     }
 
-    console.log(`[stream] AniList ID: ${anilistId}`);
-
-    const result = await streamFromMiruro(anilistId, ep, audio, proxifyBase);
+    const result = await resolveStream(anilistId, ep, audio);
 
     if (result?.url) {
       console.log("[stream] ✓", result.source);
@@ -476,7 +462,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
   } catch (err: any) {
-    console.error("[stream] Error:", err.message);
+    console.error("[stream] Unhandled error:", err.message);
     return res.status(500).json({
       url: null, subtitles: [], intro: null, outro: null,
       source: null, error: "Internal server error",
