@@ -100,26 +100,40 @@ interface SubtitleTrack {
 const malToAnilist = new Map<number, number>();
 
 function loadMapper(): void {
-  const filePath = path.join(__dirname, "../../src/data/anime-seasons.json");
-  if (!fs.existsSync(filePath)) {
-    console.error("❌ anime-seasons.json not found at:", filePath);
-    return;
-  }
+  const candidates = [
+    // Primary — copied into server/data/
+    path.join(process.cwd(), "data/anime-seasons.json"),
+    path.join(__dirname, "../data/anime-seasons.json"),
+    // Fallback — relative to compiled output
+    path.join(__dirname, "../../src/data/anime-seasons.json"),
+    path.join(process.cwd(), "src/data/anime-seasons.json"),
+    path.join(process.cwd(), "../src/data/anime-seasons.json"),
+  ];
 
-  try {
-    const raw  = fs.readFileSync(filePath, "utf-8");
-    const data = JSON.parse(raw) as AnimeEntry[];
+  console.log("🔍 CWD:", process.cwd());
+  console.log("🔍 __dirname:", __dirname);
 
-    for (const entry of data) {
-      if (entry.mal_id && entry.anilist_id) {
-        malToAnilist.set(entry.mal_id, entry.anilist_id);
+  for (const filePath of candidates) {
+    if (fs.existsSync(filePath)) {
+      try {
+        const raw  = fs.readFileSync(filePath, "utf-8");
+        const data = JSON.parse(raw) as AnimeEntry[];
+
+        for (const entry of data) {
+          if (entry.mal_id && entry.anilist_id) {
+            malToAnilist.set(entry.mal_id, entry.anilist_id);
+          }
+        }
+
+        console.log(`✅ Mapper loaded: ${malToAnilist.size} entries`);
+        return;
+      } catch (err: any) {
+        console.error("❌ Parse error:", err.message);
       }
     }
-
-    console.log(`✅ Mapper loaded: ${malToAnilist.size} entries`);
-  } catch (err: any) {
-    console.error("❌ Failed to load mapper:", err.message);
   }
+
+  console.error("❌ Could not find anime-seasons.json!");
 }
 
 loadMapper();
