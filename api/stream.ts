@@ -7,12 +7,49 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 // ── Config ──────────────────────────────────────────────────────
 const MIRURO_API = "https://api-test-blush-one.vercel.app";
 const PROXIFY_API = "https://web-production-3a1a9.up.railway.app";
-const ANILIST_GRAPHQL = "https://graphql.anilist.co";
+
+// The Miruro API has undocumented Origin/Referer access control.
+// "miruro.tv" is the real Miruro frontend — the API only accepts
+// requests that look like they come from its own frontend.
+//   No headers  → 403 "Invalid Origin, Referer, or API Key"
+//   With these  → 200 OK
+const MIRURO_ORIGIN = "https://miruro.tv";
 
 const PROVIDER_ORDER = ["kiwi", "arc", "zoro", "jet"];
 const TIMEOUT_EPISODES = 12_000;
 const TIMEOUT_WATCH = 12_000;
 const TIMEOUT_PROXIFY = 8_000;
+
+// ── Local MAL → AniList mapper (loaded once at cold start) ──────
+interface MapperEntry {
+  mal_id: number;
+  anilist_id: number;
+  type?: string;
+  season?: { tvdb?: number; tmdb?: number };
+}
+
+// Vercel bundles this JSON into the function at build time
+const mapperData: MapperEntry[] = require("../src/data/anime-seasons.json");
+
+const malToAnilistMap = new Map<number, number>();
+for (const entry of mapperData) {
+  if (entry.mal_id && entry.anilist_id) {
+    malToAnilistMap.set(entry.mal_id, entry.anilist_id);
+  }
+}
+console.log(`[mapper] Loaded ${malToAnilistMap.size} MAL→AniList entries`);
+
+/** Build browser-like headers for a given Miruro origin */
+function miruroHeaders(origin: string): Record<string, string> {
+  return {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    Accept: "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    Referer: `${origin}/`,
+    Origin: origin,
+  };
+}
 
 // ── Types ───────────────────────────────────────────────────────
 interface MiruroEpisode {
@@ -46,29 +83,58 @@ interface SubtitleTrack {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-/** Fetch JSON with a hard timeout */
+/**
+ * Fetch JSON with a hard timeout.
+ * Tries each Miruro origin until one doesn't return 403.
+ * This handles the API's Origin/Referer access control.
+ */
 async function fetchJson<T>(url: string, timeoutMs: number): Promise<T> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let lastError: Error | null = null;
 
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; SamuraiAnime/1.0)",
-        Accept: "application/json",
-      },
-    });
+  for (const origin of MIRURO_ORIGINS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+    try {
+      const res = await fetch(url, {
+        signal: controller.signal,
+        headers: miruroHeaders(origin),
+      });
+
+      clearTimeout(timer);
+
+      if (res.status === 403) {
+        const body = await res.text().catch(() => "");
+        console.warn(`[fetchJson] 403 with origin ${origin}: ${body.slice(0, 100)}`);
+        lastError = new Error(`HTTP 403 with origin ${origin}`);
+        continue; // try next origin
+      }
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+      }
+
+      return (await res.json()) as T;
+    } catch (err: any) {
+      clearTimeout(timer);
+      if (err.name === "AbortError") {
+        throw new Error(`Timeout after ${timeoutMs}ms`);
+      }
+      // If it's a 403 we already continued; re-throw other errors
+      if (err.message?.includes("HTTP 403")) {
+        lastError = err;
+        continue;
+      }
+      throw err;
     }
-
-    return (await res.json()) as T;
-  } finally {
-    clearTimeout(timer);
   }
+
+  // All origins failed with 403
+  throw (
+    lastError ??
+    new Error("All Miruro origins returned 403 — check API key or allowed origins")
+  );
 }
 
 /** Convert MAL ID → AniList ID via GraphQL (no static file needed) */
@@ -159,10 +225,7 @@ async function proxifyStream(
     const endpoint = `${PROXIFY_API}/proxy?data=${encodeURIComponent(data)}`;
 
     const res = await fetch(endpoint, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; SamuraiAnime/1.0)",
-        Accept: "application/json",
-      },
+      headers: miruroHeaders(MIRURO_ORIGINS[0]),
       signal: AbortSignal.timeout(TIMEOUT_PROXIFY),
     });
 
