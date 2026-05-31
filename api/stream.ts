@@ -1,18 +1,16 @@
 // api/stream.ts — Vercel Serverless Function
-// Miruro Native API stream resolver + Unified Stream Proxy
-// Replaces the Express server's /api/stream route
+// Stream resolver: local MAL→AniList mapper + Miruro 3-step flow + Stream Proxy
+//
+// The Miruro API has undocumented Origin/Referer access control.
+// Without "Referer: https://miruro.tv/" and "Origin: https://miruro.tv"
+// headers, every request gets 403. This is NOT in their docs — I verified
+// it by testing: no headers → 403, with them → 200.
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 // ── Config ──────────────────────────────────────────────────────
 const MIRURO_API = "https://api-test-blush-one.vercel.app";
 const PROXIFY_API = "https://web-production-3a1a9.up.railway.app";
-
-// The Miruro API has undocumented Origin/Referer access control.
-// "miruro.tv" is the real Miruro frontend — the API only accepts
-// requests that look like they come from its own frontend.
-//   No headers  → 403 "Invalid Origin, Referer, or API Key"
-//   With these  → 200 OK
 const MIRURO_ORIGIN = "https://miruro.tv";
 
 const PROVIDER_ORDER = ["kiwi", "arc", "zoro", "jet"];
@@ -20,7 +18,17 @@ const TIMEOUT_EPISODES = 12_000;
 const TIMEOUT_WATCH = 12_000;
 const TIMEOUT_PROXIFY = 8_000;
 
-// ── Local MAL → AniList mapper (loaded once at cold start) ──────
+// ── Browser-like headers for the Miruro API ─────────────────────
+const MIRURO_HEADERS: Record<string, string> = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  Referer: `${MIRURO_ORIGIN}/`,
+  Origin: MIRURO_ORIGIN,
+};
+
+// ── Local MAL → AniList mapper (bundled at build time) ──────────
 interface MapperEntry {
   mal_id: number;
   anilist_id: number;
@@ -28,7 +36,6 @@ interface MapperEntry {
   season?: { tvdb?: number; tmdb?: number };
 }
 
-// Vercel bundles this JSON into the function at build time
 const mapperData: MapperEntry[] = require("../src/data/anime-seasons.json");
 
 const malToAnilistMap = new Map<number, number>();
@@ -38,18 +45,6 @@ for (const entry of mapperData) {
   }
 }
 console.log(`[mapper] Loaded ${malToAnilistMap.size} MAL→AniList entries`);
-
-/** Build browser-like headers for a given Miruro origin */
-function miruroHeaders(origin: string): Record<string, string> {
-  return {
-    "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    Accept: "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    Referer: `${origin}/`,
-    Origin: origin,
-  };
-}
 
 // ── Types ───────────────────────────────────────────────────────
 interface MiruroEpisode {
@@ -83,86 +78,25 @@ interface SubtitleTrack {
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-/**
- * Fetch JSON with a hard timeout.
- * Tries each Miruro origin until one doesn't return 403.
- * This handles the API's Origin/Referer access control.
- */
+/** Fetch JSON with a hard timeout + Miruro headers */
 async function fetchJson<T>(url: string, timeoutMs: number): Promise<T> {
-  let lastError: Error | null = null;
-
-  for (const origin of MIRURO_ORIGINS) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: miruroHeaders(origin),
-      });
-
-      clearTimeout(timer);
-
-      if (res.status === 403) {
-        const body = await res.text().catch(() => "");
-        console.warn(`[fetchJson] 403 with origin ${origin}: ${body.slice(0, 100)}`);
-        lastError = new Error(`HTTP 403 with origin ${origin}`);
-        continue; // try next origin
-      }
-
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
-      }
-
-      return (await res.json()) as T;
-    } catch (err: any) {
-      clearTimeout(timer);
-      if (err.name === "AbortError") {
-        throw new Error(`Timeout after ${timeoutMs}ms`);
-      }
-      // If it's a 403 we already continued; re-throw other errors
-      if (err.message?.includes("HTTP 403")) {
-        lastError = err;
-        continue;
-      }
-      throw err;
-    }
-  }
-
-  // All origins failed with 403
-  throw (
-    lastError ??
-    new Error("All Miruro origins returned 403 — check API key or allowed origins")
-  );
-}
-
-/** Convert MAL ID → AniList ID via GraphQL (no static file needed) */
-async function malToAnilist(malId: number): Promise<number | null> {
-  const query = `
-    query ($malId: Int) {
-      Media(idMal: $malId, type: ANIME) {
-        id
-      }
-    }
-  `;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(ANILIST_GRAPHQL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: JSON.stringify({ query, variables: { malId } }),
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: MIRURO_HEADERS,
     });
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+    }
 
-    const json = (await res.json()) as any;
-    return json?.data?.Media?.id ?? null;
-  } catch {
-    return null;
+    return (await res.json()) as T;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -225,7 +159,7 @@ async function proxifyStream(
     const endpoint = `${PROXIFY_API}/proxy?data=${encodeURIComponent(data)}`;
 
     const res = await fetch(endpoint, {
-      headers: miruroHeaders(MIRURO_ORIGINS[0]),
+      headers: MIRURO_HEADERS,
       signal: AbortSignal.timeout(TIMEOUT_PROXIFY),
     });
 
@@ -288,8 +222,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   console.log(`${"═".repeat(50)}`);
 
   try {
-    // ── Step 0: MAL → AniList ID ────────────────────────────────
-    const anilistId = await malToAnilist(malIdNum);
+    // ── Step 0: MAL → AniList ID (from local mapper) ─────────────
+    const anilistId = malToAnilistMap.get(malIdNum) ?? null;
 
     if (!anilistId) {
       return res.status(200).json({
@@ -298,7 +232,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         intro: null,
         outro: null,
         source: null,
-        error: `Could not resolve AniList ID for MAL ${malIdNum}`,
+        error: `MAL ID ${malIdNum} not in mapper database (has ${malToAnilistMap.size} entries)`,
       });
     }
 
